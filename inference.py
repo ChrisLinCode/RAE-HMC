@@ -1,7 +1,7 @@
 # inference.py
-# RAE-HMC M4: Score Fusion & Thresholding (aligned with thesis §3.6)
-# - s_final = γ * s_mem + (1 - γ) * s_cls
-# - Binarization with a single global threshold θ (no additional closure)
+# RAE-HMC M4: Score Fusion & Binarization (aligned with thesis §3.6)
+# - s_final = eta * s_mem + (1 - eta) * s_cls
+# - Binarization with a single global delta (no additional closure)
 # - Batch inference utilities, optional top-k selection, and ef_search control
 
 from __future__ import annotations
@@ -18,8 +18,8 @@ Tensor = torch.Tensor
 # -----------------------------
 @dataclass
 class InferenceConfig:
-    gamma: float = 0.5           # fusion coefficient γ
-    threshold: float = 0.5       # global decision threshold θ
+    eta: float = 0.5           # fusion coefficient eta
+    delta: float = 0.5       # global decision delta
     topk: Optional[int] = None   # optional: keep top-k before/after closure (applied before closure if set)
     use_logits_for_topk: bool = False  # if True, top-k uses logits-like space; here scores already in [0,1]
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -84,7 +84,7 @@ class InferenceEngine:
       - p_cls: [B, L] classifier probabilities (from M3)
     Outputs:
       - s_final: [B, L] fused scores
-      - y_hat:   [B, L] binary predictions after thresholding
+      - y_hat:   [B, L] binary predictions after binarization
     """
 
     def __init__(self, cfg: InferenceConfig, hierarchy: Hierarchy):
@@ -92,24 +92,24 @@ class InferenceEngine:
         self.h = hierarchy
 
     # --- Fusion ---
-    def fuse_scores(self, s_mem: Tensor, p_cls: Tensor, gamma: Optional[float] = None) -> Tensor:
+    def fuse_scores(self, s_mem: Tensor, p_cls: Tensor, eta: Optional[float] = None) -> Tensor:
         """
-        s = γ * s_mem + (1 - γ) * p_cls, scores in [0,1].
+        s = eta * s_mem + (1 - eta) * p_cls, scores in [0,1].
         """
-        g = self.cfg.gamma if gamma is None else float(gamma)
+        eta_val = self.cfg.eta if eta is None else float(eta)
         # Clamp to [0,1] for safety then fuse
         s_mem = s_mem.clamp(0.0, 1.0)
         p_cls = p_cls.clamp(0.0, 1.0)
-        s = g * s_mem + (1.0 - g) * p_cls
+        s = eta_val * s_mem + (1.0 - eta_val) * p_cls
         return s
 
     # --- Binarization ---
-    def binarize(self, scores: Tensor, threshold: Optional[float] = None, topk: Optional[int] = None) -> Tensor:
+    def binarize(self, scores: Tensor, delta: Optional[float] = None, topk: Optional[int] = None) -> Tensor:
         """
-        Apply optional top-k (on scores) then global threshold θ to produce {0,1}.
-        If topk is set: keep top-k per sample as candidates (set others to 0), then apply threshold on the kept ones.
+        Apply optional top-k (on scores) then global delta to produce {0,1}.
+        If topk is set: keep top-k per sample as candidates (set others to 0), then apply delta on the kept ones.
         """
-        theta = self.cfg.threshold if threshold is None else float(threshold)
+        delta_val = self.cfg.delta if delta is None else float(delta)
         B, L = scores.shape
         y = torch.zeros_like(scores, dtype=torch.int64)
 
@@ -120,11 +120,11 @@ class InferenceEngine:
             # Build a mask for kept positions
             keep = torch.zeros_like(scores, dtype=torch.bool)
             keep.scatter_(1, idx, True)
-            # Apply threshold only on kept positions
+            # Apply delta only on kept positions
             kept_scores = scores * keep
-            y = (kept_scores >= theta).to(torch.int64)
+            y = (kept_scores >= delta_val).to(torch.int64)
         else:
-            y = (scores >= theta).to(torch.int64)
+            y = (scores >= delta_val).to(torch.int64)
         return y
 
     # --- Full pipeline for a batch ---
@@ -132,31 +132,31 @@ class InferenceEngine:
         self,
         s_mem: Tensor,   # [B, L]
         p_cls: Tensor,   # [B, L]
-        gamma: Optional[float] = None,
-        threshold: Optional[float] = None,
+        eta: Optional[float] = None,
+        delta: Optional[float] = None,
         topk: Optional[int] = None,
         return_intermediate: bool = False
     ) -> Dict[str, Tensor]:
         """
         Returns dict with binarized predictions; optionally also fused scores.
         """
-        s = self.fuse_scores(s_mem, p_cls, gamma=gamma)
-        y = self.binarize(s, threshold=threshold, topk=topk or self.cfg.topk)
+        s = self.fuse_scores(s_mem, p_cls, eta=eta)
+        y = self.binarize(s, delta=delta, topk=topk or self.cfg.topk)
         if return_intermediate:
             return {"s_final": s, "y": y}
         return {"y": y}
 
     # Convenience for single sample
     def predict_single(
-        self, s_mem_1: Tensor, p_cls_1: Tensor, gamma: Optional[float] = None,
-        threshold: Optional[float] = None, topk: Optional[int] = None
+        self, s_mem_1: Tensor, p_cls_1: Tensor, eta: Optional[float] = None,
+        delta: Optional[float] = None, topk: Optional[int] = None
     ) -> Dict[str, Tensor]:
         """
         Inputs are 1D [L], return 1D predictions.
         """
         s_mem = s_mem_1.view(1, -1)
         p_cls = p_cls_1.view(1, -1)
-        out = self.predict_batch(s_mem, p_cls, gamma=gamma, threshold=threshold, topk=topk, return_intermediate=True)
+        out = self.predict_batch(s_mem, p_cls, eta=eta, delta=delta, topk=topk, return_intermediate=True)
         return {k: v[0] for k, v in out.items()}
 
 
@@ -189,7 +189,7 @@ if __name__ == "__main__":
     edges = [(0, 3), (1, 4), (1, 5), (2, 6)]
     H = Hierarchy.from_edges(num_labels=L, edges_parent_child=edges)
 
-    cfg = InferenceConfig(gamma=0.6, threshold=0.5, topk=None, device=device)
+    cfg = InferenceConfig(eta=0.6, delta=0.5, topk=None, device=device)
     engine = InferenceEngine(cfg, H)
 
     out = engine.predict_batch(s_mem, p_cls, return_intermediate=True)

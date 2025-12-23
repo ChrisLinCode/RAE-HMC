@@ -1,6 +1,6 @@
 # memory.py
 # RAE-HMC M2 (Brute-force only): Retrieval-Augmented Semantic Memory (static)
-# - Keys K = [X; Z], Values V = [λY; (1−λ) I_L]
+# - Keys K = [X; Z], Values V = [rho Y; (1 - rho) I_L]
 # - Retrieval = exact cosine similarities via Q @ K^T + top-k + truncated softmax
 # - No external dependencies. Save/load with dtype-safe JSON.
 from __future__ import annotations
@@ -20,7 +20,7 @@ class MemoryConfig:
     # Retrieval params
     top_b: int                  # truncated neighborhood size b
     temperature: float          # τ_r
-    lambda_label: float         # λ in V = [λY; (1−λ) I_L]
+    rho: float         # rho in V = [rho Y; (1 - rho) I_L]
 
     # Device & dtype
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -58,7 +58,7 @@ class SemanticMemory:
     """
     Implements the RAE-HMC memory (§3.4) with exact cosine retrieval.
         K = [X; Z]              where X ∈ ℝ^{N×d}, Z ∈ ℝ^{L×d}
-        V = [λY; (1−λ) I_L]     where Y ∈ {0,1}^{N×L}
+        V = [rho Y; (1 - rho) I_L]     where Y in {0,1}^{N x L}
     Provides: build / query / batch_query / save / load
     """
 
@@ -79,7 +79,7 @@ class SemanticMemory:
         self._built: bool = False
 
     # ---------- Build ----------
-    def build(self, X: Tensor, Z: Tensor, Y: Tensor, lambda_label: Optional[float] = None) -> None:
+    def build(self, X: Tensor, Z: Tensor, Y: Tensor, rho: Optional[float] = None) -> None:
         """
         Args:
             X: [N, d] text embeddings
@@ -96,7 +96,7 @@ class SemanticMemory:
         if Y.shape != (N, L): raise ValueError(f"Y must be [N, L]; got {tuple(Y.shape)}")
 
         self.N, self.L, self.d = N, L, d1
-        lam = cfg.lambda_label if lambda_label is None else float(lambda_label)
+        rho_val = cfg.rho if rho is None else float(rho)
 
         if not cfg.assume_normalized:
             X = F.normalize(X, p=2, dim=-1)
@@ -105,8 +105,8 @@ class SemanticMemory:
         # CPU tensors for storage
         K = torch.cat([X, Z], dim=0).to(torch.float32).cpu()            # [N+L, d]
         I_L = torch.eye(L, dtype=torch.float32)
-        lam = max(0.0, min(1.0, lam))  # clamp to [0,1]
-        V = torch.cat([lam * Y.to(torch.float32), (1.0 - lam) * I_L], dim=0).cpu()  # [N+L, L]
+        rho_val = max(0.0, min(1.0, rho_val))  # clamp to [0,1]
+        V = torch.cat([rho_val * Y.to(torch.float32), (1.0 - rho_val) * I_L], dim=0).cpu()  # [N+L, L]
 
         self.K_cpu, self.V_cpu = K, V
         self._refresh_gpu_caches(dev)
@@ -168,6 +168,8 @@ class SemanticMemory:
         with open(os.path.join(dirname, "meta.json"), "r", encoding="utf-8") as f:
             meta = json.load(f)
         cfg_dict = meta.get("cfg", {})
+        if "rho" not in cfg_dict and "lambda_label" in cfg_dict:
+            cfg_dict["rho"] = cfg_dict.pop("lambda_label")
         cfg_dict["dtype"] = _str_to_dtype(cfg_dict.get("dtype", "float32"))
         # force brute to avoid mismatches
         cfg_dict["backend"] = "brute"
@@ -190,7 +192,7 @@ class SemanticMemory:
 # -----------------------------
 if __name__ == "__main__":
     torch.manual_seed(0)
-    cfg = MemoryConfig(top_b=5, temperature=0.07, lambda_label=1.0, assume_normalized=True, backend="brute")
+    cfg = MemoryConfig(top_b=5, temperature=0.07, rho=1.0, assume_normalized=True, backend="brute")
     N, L, d = 6, 4, 8
     X = F.normalize(torch.randn(N, d), p=2, dim=-1)
     Z = F.normalize(torch.randn(L, d), p=2, dim=-1)

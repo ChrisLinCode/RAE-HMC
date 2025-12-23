@@ -51,8 +51,8 @@ class TrainConfig:
     # Memory (M2)
     top_b: int = 200
     temperature: float = 0.04 #論文配置
-    lambda_label: float = 0.5
-    lambda_candidates: List[float] = field(default_factory=lambda: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+    rho: float = 0.5
+    rho_candidates: List[float] = field(default_factory=lambda: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
 
     # Classifier (M3)
     dropout: float = 0.1
@@ -88,11 +88,11 @@ class TrainConfig:
     inverted_pos_per_label: int = 1        # positives per active label when using inverted index
 
     # Fusion (M4)
-    gamma: float = 0.5
-    threshold: float = 0.5
+    eta: float = 0.5
+    delta: float = 0.5
     topk: Optional[int] = 15
-    gamma_candidates: List[float] = field(default_factory=lambda: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
-    threshold_candidates: List[float] = field(default_factory=lambda: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+    eta_candidates: List[float] = field(default_factory=lambda: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+    delta_candidates: List[float] = field(default_factory=lambda: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
 
     # Module switches / ablations
     use_memory: bool = True
@@ -296,58 +296,58 @@ def predict_with_strategy(
     p_cls: torch.Tensor,
     engine: InferenceEngine,
     cfg: TrainConfig,
-    gamma_override: Optional[float] = None,
-    threshold_override: Optional[float] = None,
+    eta_override: Optional[float] = None,
+    delta_override: Optional[float] = None,
 ) -> torch.Tensor:
     """
     Decide prediction path based on available modules.
     - If memory + fusion (auto when memory on): fuse s_mem and p_cls.
-    - If memory only: threshold memory scores.
-    - Else: threshold classifier scores (global or global+local depending on clf config).
+    - If memory only: apply delta cutoff to memory scores.
+    - Else: apply delta cutoff to classifier scores (global or global+local depending on clf config).
     """
-    gamma = gamma_override if gamma_override is not None else cfg.gamma
-    threshold = threshold_override if threshold_override is not None else cfg.threshold
+    eta = eta_override if eta_override is not None else cfg.eta
+    delta = delta_override if delta_override is not None else cfg.delta
     fusion_on = cfg.use_memory and (cfg.use_global_branch or cfg.use_local_branch)
     if fusion_on:
         return engine.predict_batch(
-            s_mem, p_cls, gamma=gamma, threshold=threshold
+            s_mem, p_cls, eta=eta, delta=delta
         )["y"]
     if cfg.use_memory:
-        return (s_mem >= threshold).to(torch.int64)
-    return (p_cls >= threshold).to(torch.int64)
+        return (s_mem >= delta).to(torch.int64)
+    return (p_cls >= delta).to(torch.int64)
 
 
 def classifier_enabled(cfg: TrainConfig) -> bool:
     return bool(cfg.use_global_branch or cfg.use_local_branch)
 
 
-def tune_memory_only_threshold(
+def tune_memory_only_delta(
     s_mem_val: torch.Tensor,
     Y_val: torch.Tensor,
     cfg: TrainConfig,
 ) -> Tuple[float, float]:
     """
-    Tune a single global threshold θ for memory-only predictions:
-        y_hat = 1[s_mem >= θ]
-    Returns (best_threshold, best_micro_f1).
+    Tune a single global delta for memory-only predictions:
+        y_hat = 1[s_mem >= delta]
+    Returns (best_delta, best_micro_f1).
     """
     y_true = (Y_val.detach().cpu().numpy() > 0.5).astype(np.int32)
-    candidates = list(getattr(cfg, "threshold_candidates", None) or [cfg.threshold])
-    if cfg.threshold not in candidates:
-        candidates.append(cfg.threshold)
+    candidates = list(getattr(cfg, "delta_candidates", None) or [cfg.delta])
+    if cfg.delta not in candidates:
+        candidates.append(cfg.delta)
     # Guard: keep within [0,1]
     candidates = [float(max(0.0, min(1.0, t))) for t in candidates]
 
-    best_thr = float(cfg.threshold)
+    best_delta = float(cfg.delta)
     best_micro = -1.0
     s_cpu = s_mem_val.detach().cpu()
-    for thr in candidates:
-        y_pred = (s_cpu >= thr).numpy().astype(np.int32)
+    for delta_val in candidates:
+        y_pred = (s_cpu >= delta_val).numpy().astype(np.int32)
         micro = micro_f1(y_true, y_pred)
         if micro > best_micro:
             best_micro = micro
-            best_thr = float(thr)
-    return best_thr, best_micro
+            best_delta = float(delta_val)
+    return best_delta, best_micro
 
 
 def encode_with_encoder(
@@ -488,28 +488,28 @@ def tune_fusion_parameters(
 ) -> Tuple[float, float, float]:
     fusion_on = cfg.use_memory and (cfg.use_global_branch or cfg.use_local_branch)
     if not fusion_on:
-        return cfg.gamma, cfg.threshold, -1.0
+        return cfg.eta, cfg.delta, -1.0
     X_va_enc = encode_with_encoder(enc, tokens, cfg.batch_size, device)
     X_va_dev = X_va_enc.to(device)
     with torch.no_grad():
         p_cls_va = clf(X_va_dev)["p_cls"]
         s_mem_va = mem.batch_query(X_va_dev)
     y_true_va = (Y_val.cpu().numpy() > 0.5).astype(np.int32)
-    best_gamma = cfg.gamma
-    best_threshold = cfg.threshold
+    best_eta = cfg.eta
+    best_delta = cfg.delta
     best_micro = -1.0
-    for gamma in cfg.gamma_candidates:
-        for thr in cfg.threshold_candidates:
+    for eta in cfg.eta_candidates:
+        for delta_val in cfg.delta_candidates:
             pred = engine.predict_batch(
-                s_mem_va, p_cls_va, gamma=gamma, threshold=thr
+                s_mem_va, p_cls_va, eta=eta, delta=delta_val
             )
             y_pred = pred["y"].cpu().numpy().astype(np.int32)
             micro = micro_f1(y_true_va, y_pred)
             if micro > best_micro:
                 best_micro = micro
-                best_gamma = gamma
-                best_threshold = thr
-    return best_gamma, best_threshold, best_micro
+                best_eta = eta
+                best_delta = delta_val
+    return best_eta, best_delta, best_micro
 
 
 
@@ -580,8 +580,8 @@ def main(cfg: TrainConfig, summary: Optional[List[Dict[str, float]]] = None, sce
             print("\n[Ablation Summary]")
             for item in summary:
                 use_memory = bool(item.get("use_memory", True))
-                gamma_print = 0.0 if not use_memory else float(item.get("gamma", 0.0))
-                print(f"  - {item['scenario']}: gamma={gamma_print:.2f}, threshold={item['threshold']:.2f}, "
+                eta_print = 0.0 if not use_memory else float(item.get("eta", 0.0))
+                print(f"  - {item['scenario']}: eta={eta_print:.2f}, delta={item['delta']:.2f}, "
                       f"micro-F1={item['micro']:.4f}, macro-F1(all)={item['macro_all']:.4f}")
         return None
 
@@ -647,7 +647,7 @@ def main(cfg: TrainConfig, summary: Optional[List[Dict[str, float]]] = None, sce
         backend="brute",
         top_b=cfg.top_b,
         temperature=cfg.temperature,
-        lambda_label=cfg.lambda_label,
+        rho=cfg.rho,
         device=device_str
     )
 
@@ -702,10 +702,10 @@ def main(cfg: TrainConfig, summary: Optional[List[Dict[str, float]]] = None, sce
 
     print("\n[CV] Fold summary:")
     for res in fold_results:
-        lam_info = res.get("last_tuned_lambda", None)
-        if lam_info is not None:
+        rho_info = res.get("last_tuned_rho", None)
+        if rho_info is not None:
             print(f"  - {res['fold']}: best val micro-F1={res['best_val_micro']:.4f}, "
-                  f"lambda={lam_info:.2f}, checkpoint={res['best_path']}")
+                  f"rho={rho_info:.2f}, checkpoint={res['best_path']}")
         else:
             print(f"  - {res['fold']}: best val micro-F1={res['best_val_micro']:.4f}, "
                   f"checkpoint={res['best_path']}")
@@ -725,10 +725,10 @@ def main(cfg: TrainConfig, summary: Optional[List[Dict[str, float]]] = None, sce
             except OSError as e:
                 print(f"[Cleanup] Failed to remove {path}: {e}")
 
-    gamma_final = best_fold["last_tuned_gamma"] if best_fold.get("last_tuned_gamma") is not None else cfg.gamma
-    threshold_final = best_fold["last_tuned_threshold"] if best_fold.get("last_tuned_threshold") is not None else cfg.threshold
-    lambda_final = best_fold["last_tuned_lambda"] if best_fold.get("last_tuned_lambda") is not None else cfg.lambda_label
-    mem_cfg_final = replace(mem_cfg, lambda_label=lambda_final)
+    eta_final = best_fold["last_tuned_eta"] if best_fold.get("last_tuned_eta") is not None else cfg.eta
+    delta_final = best_fold["last_tuned_delta"] if best_fold.get("last_tuned_delta") is not None else cfg.delta
+    rho_final = best_fold["last_tuned_rho"] if best_fold.get("last_tuned_rho") is not None else cfg.rho
+    mem_cfg_final = replace(mem_cfg, rho=rho_final)
 
     # ----------------- Retrain on full training data -----------------
     enc, clf, clf_cfg_full = train_full_model(
@@ -753,7 +753,7 @@ def main(cfg: TrainConfig, summary: Optional[List[Dict[str, float]]] = None, sce
         clf.eval()
 
     engine = InferenceEngine(
-        InferenceConfig(gamma=gamma_final, threshold=threshold_final, topk=cfg.topk, device=device_str),
+        InferenceConfig(eta=eta_final, delta=delta_final, topk=cfg.topk, device=device_str),
         hierarchy_obj
     )
 
@@ -764,7 +764,8 @@ def main(cfg: TrainConfig, summary: Optional[List[Dict[str, float]]] = None, sce
         mem = SemanticMemory(mem_cfg_final)
         mem.build(X_tr_mem, Z_eval, Y_tr_full.detach().cpu())
 
-    print(f"[Final Tuning] Using gamma={gamma_final:.2f}, threshold={threshold_final:.2f}, lambda={lambda_final:.2f} derived from best fold.")
+    print(f"[Final Tuning] Using eta={eta_final:.2f}, delta={delta_final:.2f}, rho={rho_final:.2f} derived from best fold. "
+          f"(rho=標籤/樣本參數, eta=記憶/分類融合參數, delta=二值化閾值)")
 
     X_te_enc = encode_with_encoder(enc, test_tokens, cfg.batch_size, device)
     X_te_dev = X_te_enc.to(device)
@@ -779,8 +780,8 @@ def main(cfg: TrainConfig, summary: Optional[List[Dict[str, float]]] = None, sce
         p_cls=p_cls_te,
         engine=engine,
         cfg=cfg,
-        gamma_override=gamma_final,
-        threshold_override=threshold_final,
+        eta_override=eta_final,
+        delta_override=delta_final,
     )
 
     y_true_te = (Y_te.cpu().numpy() > 0.5).astype(np.int32)
@@ -802,8 +803,8 @@ def main(cfg: TrainConfig, summary: Optional[List[Dict[str, float]]] = None, sce
         "encoder_state": enc.state_dict(),
         "classifier_state": (clf.state_dict() if clf is not None else None),
         "clf_cfg": clf_cfg_full.__dict__,
-        "gamma": gamma_final,
-        "threshold": threshold_final,
+        "eta": eta_final,
+        "delta": delta_final,
         "memory_only": (clf is None) and bool(cfg.use_memory),
     }, full_ckpt_path)
     print(f"[Save] Full-train checkpoint saved to {full_ckpt_path}")
@@ -817,8 +818,8 @@ def main(cfg: TrainConfig, summary: Optional[List[Dict[str, float]]] = None, sce
     scenario = scenario_name if scenario_name is not None else os.path.basename(cfg.workdir.rstrip(os.sep))
     return {
         "scenario": scenario,
-        "gamma": gamma_final,
-        "threshold": threshold_final,
+        "eta": eta_final,
+        "delta": delta_final,
         "micro": micro,
         "macro_all": macro_all,
         "use_memory": bool(cfg.use_memory),
@@ -884,7 +885,7 @@ def train_single_fold(
     label_tokens_device = move_tokens_to_device(label_tokens, device)
     comb = JointLossCombiner(clf_cfg).to(device)
     engine = InferenceEngine(
-        InferenceConfig(gamma=cfg.gamma, threshold=cfg.threshold, topk=cfg.topk, device=device_str),
+        InferenceConfig(eta=cfg.eta, delta=cfg.delta, topk=cfg.topk, device=device_str),
         hierarchy_obj
     )
 
@@ -916,16 +917,33 @@ def train_single_fold(
     steps_per_epoch = base_steps + extra_steps
 
     pos_tr = to_pos_idx_list(Y_tr, label_levels)
+    num_labels = int(sum(hd.level_sizes))
     best_f1 = -1.0
     best_loss = float("inf")
     best_path = os.path.join(cfg.workdir, f"best_model_{fold_name}.pt")
     patience = 3
     stale = 0
-    last_tuned_gamma = cfg.gamma
-    last_tuned_threshold = cfg.threshold
-    last_tuned_lambda = cfg.lambda_label
+    last_tuned_eta = cfg.eta
+    last_tuned_delta = cfg.delta
+    last_tuned_rho = cfg.rho
 
     def run_indices(batch_indices: List[int], opt, scheduler, running: Dict[str, float], trainable_params: List[torch.nn.Parameter]):
+        need_cls = (clf is not None) and (
+            getattr(comb.loss, "use_bce_loss", True)
+            or (getattr(comb.loss, "use_path_loss", False) and getattr(comb.loss, "weight_path", 0.0) != 0.0)
+        )
+        need_z = (
+            (getattr(comb.loss, "use_align_loss", False) and getattr(comb.loss, "weight_align", 0.0) != 0.0)
+            or (
+                getattr(comb.loss, "use_label_loss", False)
+                and getattr(comb.loss, "weight_label", 0.0) != 0.0
+                and getattr(comb, "label_loss_fn", None) is not None
+            )
+        )
+        need_sample = (
+            getattr(comb.loss, "use_sample_loss", False)
+            and getattr(comb.loss, "weight_sample_contrast", 0.0) != 0.0
+        )
         for start in range(0, len(batch_indices), B):
             batch_idx = batch_indices[start:start + B]
             if not batch_idx:
@@ -939,13 +957,15 @@ def train_single_fold(
                 batch_kwargs["token_type_ids"] = batch_tokens["token_type_ids"]
             h_x = enc.forward(**batch_kwargs)
 
-            label_kwargs = {
-                "input_ids": label_tokens_device["input_ids"],
-                "attention_mask": label_tokens_device["attention_mask"],
-            }
-            if "token_type_ids" in label_tokens_device:
-                label_kwargs["token_type_ids"] = label_tokens_device["token_type_ids"]
-            Z = enc.forward(**label_kwargs)
+            Z = None
+            if need_z:
+                label_kwargs = {
+                    "input_ids": label_tokens_device["input_ids"],
+                    "attention_mask": label_tokens_device["attention_mask"],
+                }
+                if "token_type_ids" in label_tokens_device:
+                    label_kwargs["token_type_ids"] = label_tokens_device["token_type_ids"]
+                Z = enc.forward(**label_kwargs)
 
             batch_idx_tensor = torch.tensor(batch_idx, dtype=torch.long)
             Yb = Y_tr.index_select(0, batch_idx_tensor).to(device)
@@ -954,7 +974,7 @@ def train_single_fold(
 
             extra_feats = None
             extra_labels = None
-            if inv_index is not None and Y_tr_cpu is not None:
+            if need_sample and inv_index is not None and Y_tr_cpu is not None:
                 extra_indices = sample_cross_batch_positives(
                     batch_idx, Y_tr_cpu, inv_index, per_label=cfg.inverted_pos_per_label
                 )
@@ -965,13 +985,12 @@ def train_single_fold(
                     extra_idx_tensor = torch.tensor(extra_indices, dtype=torch.long)
                     extra_labels = Y_tr.index_select(0, extra_idx_tensor).to(device)
 
-            if clf is not None:
+            if need_cls:
                 out = clf(h_x)
                 p_cls = out["p_cls"]
                 p_local = out.get("p_local")
             else:
-                L = int(sum(hd.level_sizes))
-                p_cls = torch.zeros(h_x.size(0), L, device=device)
+                p_cls = torch.zeros(h_x.size(0), num_labels, device=device)
                 p_local = None
 
             losses = comb(
@@ -1048,8 +1067,8 @@ def train_single_fold(
             # For memory-only (no M3), validate after each contrast epoch and save best encoder.
             if (not cls_on) and cfg.use_memory:
                 enc.eval()
-                tuned_lambda = cfg.lambda_label
-                tuned_threshold = cfg.threshold
+                tuned_rho = cfg.rho
+                tuned_delta = cfg.delta
                 best_micro = -1.0
                 best_s_mem_va: Optional[torch.Tensor] = None
 
@@ -1058,37 +1077,36 @@ def train_single_fold(
                 X_va_enc = encode_with_encoder(enc, val_tokens, cfg.batch_size, device)
                 X_va_dev = X_va_enc.to(device)
 
-                lambda_candidates = list(getattr(cfg, "lambda_candidates", None) or [cfg.lambda_label])
-                if cfg.lambda_label not in lambda_candidates:
-                    lambda_candidates.append(cfg.lambda_label)
+                rho_candidates = list(getattr(cfg, "rho_candidates", None) or [cfg.rho])
+                if cfg.rho not in rho_candidates:
+                    rho_candidates.append(cfg.rho)
 
-                for lam in lambda_candidates:
+                for rho_val in rho_candidates:
                     mem_tmp = SemanticMemory(mem_cfg)
-                    mem_tmp.build(X_tr_mem, Z_eval, Y_tr.detach().cpu(), lambda_label=lam)
+                    mem_tmp.build(X_tr_mem, Z_eval, Y_tr.detach().cpu(), rho=rho_val)
                     with torch.no_grad():
                         s_mem_va = mem_tmp.batch_query(X_va_dev)
-                    thr, micro = tune_memory_only_threshold(s_mem_va, Y_va, cfg)
+                    delta_val, micro = tune_memory_only_delta(s_mem_va, Y_va, cfg)
                     if micro > best_micro:
                         best_micro = micro
-                        tuned_lambda = float(lam)
-                        tuned_threshold = float(thr)
+                        tuned_rho = float(rho_val)
+                        tuned_delta = float(delta_val)
                         best_s_mem_va = s_mem_va.detach()
 
                 y_true_va = (Y_va.cpu().numpy() > 0.5).astype(np.int32)
                 L = int(sum(hd.level_sizes))
                 s_for_eval = best_s_mem_va if best_s_mem_va is not None else torch.zeros(X_va_dev.size(0), L, device=X_va_dev.device)
-                y_pred_va = (s_for_eval.detach().cpu().numpy() >= tuned_threshold).astype(np.int32)
+                y_pred_va = (s_for_eval.detach().cpu().numpy() >= tuned_delta).astype(np.int32)
                 micro = micro_f1(y_true_va, y_pred_va)
                 macro_all = macro_f1(y_true_va, y_pred_va)
-                macro_supported = macro_f1_supported(y_true_va, y_pred_va)
-                print(f"[{fold_name} | Contrast Ep {ep}] VAL  micro-F1={micro:.4f}  macro-F1(all)={macro_all:.4f}  "
-                      f"macro-F1(supported)={macro_supported:.4f}  (memory_only: lambda={tuned_lambda:.2f}, thr={tuned_threshold:.2f})")
+                print(f"[{fold_name} | Contrast Ep {ep}] VAL  micro-F1={micro:.4f}  macro-F1={macro_all:.4f}  "
+                      f"(memory_only: rho={tuned_rho:.2f}, delta={tuned_delta:.2f})")
 
                 if micro > best_f1:
                     best_f1 = micro
-                    last_tuned_gamma = 1.0
-                    last_tuned_threshold = tuned_threshold
-                    last_tuned_lambda = tuned_lambda
+                    last_tuned_eta = 1.0
+                    last_tuned_delta = tuned_delta
+                    last_tuned_rho = tuned_rho
                     torch.save({
                         "encoder_state": enc.state_dict(),
                         "classifier_state": None,
@@ -1096,9 +1114,9 @@ def train_single_fold(
                         "val_micro_f1": best_f1,
                         "epoch": ep,
                         "memory_only": True,
-                        "lambda_label": tuned_lambda,
-                        "gamma": 1.0,
-                        "threshold": tuned_threshold,
+                        "rho": tuned_rho,
+                        "eta": 1.0,
+                        "delta": tuned_delta,
                     }, best_path)
                     print(f"  -> saved best checkpoint to {best_path}")
                     stale = 0
@@ -1123,35 +1141,35 @@ def train_single_fold(
             X_va_enc = encode_with_encoder(enc, val_tokens, cfg.batch_size, device)
             X_va_dev = X_va_enc.to(device)
 
-            tuned_lambda = cfg.lambda_label
-            tuned_threshold = cfg.threshold
+            tuned_rho = cfg.rho
+            tuned_delta = cfg.delta
             best_micro = -1.0
             best_s_mem_va: Optional[torch.Tensor] = None
 
-            lambda_candidates = list(getattr(cfg, "lambda_candidates", None) or [cfg.lambda_label])
-            if cfg.lambda_label not in lambda_candidates:
-                lambda_candidates.append(cfg.lambda_label)
+            rho_candidates = list(getattr(cfg, "rho_candidates", None) or [cfg.rho])
+            if cfg.rho not in rho_candidates:
+                rho_candidates.append(cfg.rho)
 
-            for lam in lambda_candidates:
+            for rho_val in rho_candidates:
                 mem_tmp = SemanticMemory(mem_cfg)
-                mem_tmp.build(X_tr_mem, Z_eval, Y_tr.detach().cpu(), lambda_label=lam)
+                mem_tmp.build(X_tr_mem, Z_eval, Y_tr.detach().cpu(), rho=rho_val)
                 with torch.no_grad():
                     s_mem_va = mem_tmp.batch_query(X_va_dev)
-                thr, micro = tune_memory_only_threshold(s_mem_va, Y_va, cfg)
+                delta_val, micro = tune_memory_only_delta(s_mem_va, Y_va, cfg)
                 if micro > best_micro:
                     best_micro = micro
-                    tuned_lambda = float(lam)
-                    tuned_threshold = float(thr)
+                    tuned_rho = float(rho_val)
+                    tuned_delta = float(delta_val)
                     best_s_mem_va = s_mem_va.detach()
 
-            last_tuned_gamma = 1.0
-            last_tuned_threshold = tuned_threshold
-            last_tuned_lambda = tuned_lambda
+            last_tuned_eta = 1.0
+            last_tuned_delta = tuned_delta
+            last_tuned_rho = tuned_rho
 
             y_true_va = (Y_va.cpu().numpy() > 0.5).astype(np.int32)
             L = int(sum(hd.level_sizes))
             s_for_eval = best_s_mem_va if best_s_mem_va is not None else torch.zeros(X_va_dev.size(0), L, device=X_va_dev.device)
-            y_pred_va = (s_for_eval.detach().cpu().numpy() >= tuned_threshold).astype(np.int32)
+            y_pred_va = (s_for_eval.detach().cpu().numpy() >= tuned_delta).astype(np.int32)
             best_f1 = micro_f1(y_true_va, y_pred_va)
             torch.save({
                 "encoder_state": enc.state_dict(),
@@ -1160,11 +1178,11 @@ def train_single_fold(
                 "val_micro_f1": best_f1,
                 "epoch": 0,
                 "memory_only": True,
-                "lambda_label": tuned_lambda,
-                "gamma": 1.0,
-                "threshold": tuned_threshold,
+                "rho": tuned_rho,
+                "eta": 1.0,
+                "delta": tuned_delta,
             }, best_path)
-            print(f"[{fold_name}] Saved memory-only checkpoint to {best_path} (micro-F1={best_f1:.4f}, lambda={tuned_lambda:.2f}, thr={tuned_threshold:.2f})")
+            print(f"[{fold_name}] Saved memory-only checkpoint to {best_path} (micro-F1={best_f1:.4f}, rho={tuned_rho:.2f}, delta={tuned_delta:.2f})")
 
         return {
             "fold": fold_name,
@@ -1172,9 +1190,9 @@ def train_single_fold(
             "best_path": best_path if os.path.exists(best_path) else None,
             "train_indices": train_indices,
             "val_indices": val_indices,
-            "last_tuned_gamma": last_tuned_gamma,
-            "last_tuned_threshold": last_tuned_threshold,
-            "last_tuned_lambda": last_tuned_lambda,
+            "last_tuned_eta": last_tuned_eta,
+            "last_tuned_delta": last_tuned_delta,
+            "last_tuned_rho": last_tuned_rho,
         }
 
     comb.loss.use_bce_loss = True  # BCE/Focal 強制開
@@ -1231,56 +1249,56 @@ def train_single_fold(
         clf.eval()
 
     mem = None
-    tuned_gamma = cfg.gamma
-    tuned_threshold = cfg.threshold
-    tuned_lambda = cfg.lambda_label
+    tuned_eta = cfg.eta
+    tuned_delta = cfg.delta
+    tuned_rho = cfg.rho
     tuned_micro = -1.0
     if cfg.use_memory:
         Z_eval = encode_with_encoder(enc, label_tokens, cfg.batch_size, device)
         X_tr_mem = encode_with_encoder(enc, train_tokens, cfg.batch_size, device)
-        lambda_candidates = getattr(cfg, "lambda_candidates", None) or [cfg.lambda_label]
-        lambda_candidates = list(lambda_candidates)
-        if cfg.lambda_label not in lambda_candidates:
-            lambda_candidates.append(cfg.lambda_label)
+        rho_candidates = getattr(cfg, "rho_candidates", None) or [cfg.rho]
+        rho_candidates = list(rho_candidates)
+        if cfg.rho not in rho_candidates:
+            rho_candidates.append(cfg.rho)
         fusion_on = cfg.use_memory and (cfg.use_global_branch or cfg.use_local_branch)
 
         best_mem = None
-        best_lam = None
-        best_gamma = tuned_gamma
-        best_threshold = tuned_threshold
+        best_rho = None
+        best_eta = tuned_eta
+        best_delta = tuned_delta
         best_micro = -1.0
 
-        for lam in lambda_candidates:
+        for rho_val in rho_candidates:
             mem_tmp = SemanticMemory(mem_cfg)
-            mem_tmp.build(X_tr_mem, Z_eval, Y_tr.detach().cpu(), lambda_label=lam)
+            mem_tmp.build(X_tr_mem, Z_eval, Y_tr.detach().cpu(), rho=rho_val)
 
             if fusion_on:
-                g, thr, m = tune_fusion_parameters(
+                eta_val, delta_val, m = tune_fusion_parameters(
                     enc, clf, mem_tmp, engine, val_tokens, Y_va, cfg, device
                 )
             else:
-                g, thr, m = tuned_gamma, tuned_threshold, -1.0
+                eta_val, delta_val, m = tuned_eta, tuned_delta, -1.0
 
             if best_mem is None or m > best_micro:
                 best_micro = m
                 best_mem = mem_tmp
-                best_lam = lam
-                best_gamma = g
-                best_threshold = thr
+                best_rho = rho_val
+                best_eta = eta_val
+                best_delta = delta_val
 
         mem = best_mem
-        tuned_lambda = best_lam if best_lam is not None else cfg.lambda_label
-        tuned_gamma = best_gamma
-        tuned_threshold = best_threshold
+        tuned_rho = best_rho if best_rho is not None else cfg.rho
+        tuned_eta = best_eta
+        tuned_delta = best_delta
         tuned_micro = best_micro
 
     fusion_on = cfg.use_memory and (cfg.use_global_branch or cfg.use_local_branch)
     if fusion_on and mem is not None:
-        last_tuned_gamma = tuned_gamma
-        last_tuned_threshold = tuned_threshold
-        last_tuned_lambda = tuned_lambda
-        engine.cfg.gamma = tuned_gamma
-        engine.cfg.threshold = tuned_threshold
+        last_tuned_eta = tuned_eta
+        last_tuned_delta = tuned_delta
+        last_tuned_rho = tuned_rho
+        engine.cfg.eta = tuned_eta
+        engine.cfg.delta = tuned_delta
 
     X_va_enc = encode_with_encoder(enc, val_tokens, cfg.batch_size, device)
     X_va_dev = X_va_enc.to(device)
@@ -1292,18 +1310,17 @@ def train_single_fold(
         p_cls=p_cls_va,
         engine=engine,
         cfg=cfg,
-        gamma_override=tuned_gamma,
-        threshold_override=tuned_threshold,
+        eta_override=tuned_eta,
+        delta_override=tuned_delta,
     )
     y_true_va = (Y_va.cpu().numpy() > 0.5).astype(np.int32)
     y_pred_va = pred_va.cpu().numpy().astype(np.int32)
 
     micro = micro_f1(y_true_va, y_pred_va)
     macro_all = macro_f1(y_true_va, y_pred_va)
-    macro_supported = macro_f1_supported(y_true_va, y_pred_va)
-    fusion_info = (f"(lambda={tuned_lambda:.2f}, gamma={tuned_gamma:.2f}, thr={tuned_threshold:.2f}, tuned_micro={tuned_micro:.4f})"
+    fusion_info = (f"(rho={tuned_rho:.2f}, eta={tuned_eta:.2f}, delta={tuned_delta:.2f})"
                    if (fusion_on and mem is not None) else "(fusion off)")
-    print(f"[{fold_name}] VAL (post-train tuning) micro-F1={micro:.4f}  macro-F1(all)={macro_all:.4f}  macro-F1(supported)={macro_supported:.4f}  {fusion_info}")
+    print(f"[{fold_name}] VAL (post-train tuning) micro-F1={micro:.4f}  macro-F1={macro_all:.4f}  {fusion_info}")
 
     best_f1 = micro
     torch.save({
@@ -1312,9 +1329,9 @@ def train_single_fold(
         "clf_cfg": clf_cfg.__dict__,
         "val_micro_f1": best_f1,
         "epoch": cfg.classifier_epochs,
-        "lambda_label": tuned_lambda,
-        "gamma": tuned_gamma,
-        "threshold": tuned_threshold,
+        "rho": tuned_rho,
+        "eta": tuned_eta,
+        "delta": tuned_delta,
     }, best_path)
     print(f"  -> saved checkpoint to {best_path}")
 
@@ -1324,9 +1341,9 @@ def train_single_fold(
         "best_path": best_path if os.path.exists(best_path) else None,
         "train_indices": train_indices,
         "val_indices": val_indices,
-        "last_tuned_gamma": last_tuned_gamma,
-        "last_tuned_threshold": last_tuned_threshold,
-        "last_tuned_lambda": last_tuned_lambda,
+        "last_tuned_eta": last_tuned_eta,
+        "last_tuned_delta": last_tuned_delta,
+        "last_tuned_rho": last_tuned_rho,
     }
 
 
@@ -1412,8 +1429,25 @@ def train_full_model(
     steps_per_epoch = base_steps + extra_steps
 
     pos_tr = to_pos_idx_list(Y_tr, label_levels)
+    num_labels = int(sum(hd.level_sizes))
 
     def run_indices(batch_indices: List[int], opt, scheduler, running: Dict[str, float], trainable_params: List[torch.nn.Parameter]):
+        need_cls = (clf is not None) and (
+            getattr(comb.loss, "use_bce_loss", True)
+            or (getattr(comb.loss, "use_path_loss", False) and getattr(comb.loss, "weight_path", 0.0) != 0.0)
+        )
+        need_z = (
+            (getattr(comb.loss, "use_align_loss", False) and getattr(comb.loss, "weight_align", 0.0) != 0.0)
+            or (
+                getattr(comb.loss, "use_label_loss", False)
+                and getattr(comb.loss, "weight_label", 0.0) != 0.0
+                and getattr(comb, "label_loss_fn", None) is not None
+            )
+        )
+        need_sample = (
+            getattr(comb.loss, "use_sample_loss", False)
+            and getattr(comb.loss, "weight_sample_contrast", 0.0) != 0.0
+        )
         for start in range(0, len(batch_indices), B):
             batch_idx = batch_indices[start:start + B]
             if not batch_idx:
@@ -1427,13 +1461,15 @@ def train_full_model(
                 batch_kwargs["token_type_ids"] = train_tokens["token_type_ids"].index_select(0, idx_tensor)
             h_x = enc.forward(**batch_kwargs)
 
-            label_kwargs = {
-                "input_ids": label_tokens_device["input_ids"],
-                "attention_mask": label_tokens_device["attention_mask"],
-            }
-            if "token_type_ids" in label_tokens_device:
-                label_kwargs["token_type_ids"] = label_tokens_device["token_type_ids"]
-            Z = enc.forward(**label_kwargs)
+            Z = None
+            if need_z:
+                label_kwargs = {
+                    "input_ids": label_tokens_device["input_ids"],
+                    "attention_mask": label_tokens_device["attention_mask"],
+                }
+                if "token_type_ids" in label_tokens_device:
+                    label_kwargs["token_type_ids"] = label_tokens_device["token_type_ids"]
+                Z = enc.forward(**label_kwargs)
 
             Yb = Y_tr.index_select(0, idx_tensor)
             mask_b = mask_tr.index_select(0, idx_tensor)
@@ -1441,7 +1477,7 @@ def train_full_model(
 
             extra_feats = None
             extra_labels = None
-            if inv_index is not None and Y_tr_cpu is not None:
+            if need_sample and inv_index is not None and Y_tr_cpu is not None:
                 extra_indices = sample_cross_batch_positives(
                     batch_idx, Y_tr_cpu, inv_index, per_label=cfg.inverted_pos_per_label
                 )
@@ -1451,13 +1487,12 @@ def train_full_model(
                     extra_idx_tensor = torch.tensor(extra_indices, dtype=torch.long, device=device)
                     extra_labels = Y_tr.index_select(0, extra_idx_tensor)
 
-            if clf is not None:
+            if need_cls:
                 out = clf(h_x)
                 p_cls = out["p_cls"]
                 p_local = out.get("p_local")
             else:
-                L = int(sum(hd.level_sizes))
-                p_cls = torch.zeros(h_x.size(0), L, device=device)
+                p_cls = torch.zeros(h_x.size(0), num_labels, device=device)
                 p_local = None
 
             losses = comb(
