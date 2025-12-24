@@ -41,7 +41,7 @@ class TrainConfig:
     max_len: int = 32
     batch_size: int = 16
     # Two-stage training hyperparameters
-    contrast_epochs: int = 7              # stage 1: contrastive/align pretrain epochs
+    contrast_epochs: int = 5              # stage 1: contrastive/align pretrain epochs
     classifier_epochs: int = 15           # stage 2: classifier training epochs
     contrast_lr: float = 3e-5             # encoder lr for stage 1 (also used to finetune encoder in stage 2)
     classifier_lr: float = 1e-3           # classifier head lr for stage 2
@@ -102,11 +102,14 @@ class TrainConfig:
     run_cl_ablation: bool = False  # If True, run CL-loss ablations (align/label/sample)
 
     # Sampling (tail-aware / level-aware)
-    tail_percentile: float = 50.0
-    tail_weight: float = 0.4
+    # Two-tier tail weighting by label frequency percentile (strict <= p25, mild p25-50)
+    tail_percentile_strict: float = 25.0
+    tail_percentile_mild: float = 50.0
+    tail_weight_strict: float = 1.5
+    tail_weight_mild: float = 1.25
     level_threshold: int = 4
-    level_weight: float = 0.2
-    weighted_extra_ratio: float = 0.3
+    level_weight: float = 0.5
+    weighted_extra_ratio: float = 1.0
 
     # Output dir
     workdir: str = "./outputs"
@@ -443,33 +446,55 @@ def compute_descendants(children_map: Dict[int, List[int]], L: int) -> Dict[int,
 
 def build_tail_level_masks(
     Y: torch.Tensor,
-    tail_percentile: float,
+    tail_percentile_strict: float,
+    tail_percentile_mild: float,
     level_threshold: int,
     label_levels: List[int]
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     counts = Y.sum(dim=0).cpu().numpy()
     nonzero = counts[counts > 0]
     if len(nonzero) == 0:
-        tail_thresh = 0.0
+        tail_thresh_strict = 0.0
+        tail_thresh_mild = 0.0
     else:
-        tail_percentile = min(max(tail_percentile, 0.0), 100.0)
-        tail_thresh = float(np.percentile(nonzero, tail_percentile))
-    tail_mask = torch.tensor(counts <= tail_thresh, dtype=torch.bool)
+        p_strict = min(max(tail_percentile_strict, 0.0), 100.0)
+        p_mild = min(max(tail_percentile_mild, 0.0), 100.0)
+        if p_mild < p_strict:
+            p_strict, p_mild = p_mild, p_strict
+        tail_thresh_strict = float(np.percentile(nonzero, p_strict))
+        tail_thresh_mild = float(np.percentile(nonzero, p_mild))
+    tail_mask_strict = torch.tensor(counts <= tail_thresh_strict, dtype=torch.bool)
+    tail_mask_mild = torch.tensor((counts <= tail_thresh_mild) & (counts > tail_thresh_strict), dtype=torch.bool)
     level_mask = torch.tensor([lvl >= level_threshold for lvl in label_levels], dtype=torch.bool)
-    return tail_mask, level_mask
+    return tail_mask_strict, tail_mask_mild, level_mask
 
 
 def compute_sample_weights(
     Y: torch.Tensor,
-    tail_mask: torch.Tensor,
+    tail_mask_strict: torch.Tensor,
+    tail_mask_mild: torch.Tensor,
     level_mask: torch.Tensor,
-    tail_weight: float,
+    tail_weight_strict: float,
+    tail_weight_mild: float,
     level_weight: float
 ) -> torch.Tensor:
     weights = torch.ones(Y.size(0), device=Y.device)
-    if tail_mask.any():
-        tail_hits = (Y[:, tail_mask.to(Y.device)] > 0.5).any(dim=1)
-        weights += tail_weight * tail_hits.float()
+    if tail_mask_mild.any():
+        tail_hits_mild = (Y[:, tail_mask_mild.to(Y.device)] > 0.5).any(dim=1)
+        if tail_hits_mild.any():
+            weights = torch.where(
+                tail_hits_mild,
+                torch.tensor(tail_weight_mild, device=Y.device),
+                weights
+            )
+    if tail_mask_strict.any():
+        tail_hits_strict = (Y[:, tail_mask_strict.to(Y.device)] > 0.5).any(dim=1)
+        if tail_hits_strict.any():
+            weights = torch.where(
+                tail_hits_strict,
+                torch.tensor(tail_weight_strict, device=Y.device),
+                weights
+            )
     if level_mask.any():
         level_hits = (Y[:, level_mask.to(Y.device)] > 0.5).any(dim=1)
         weights += level_weight * level_hits.float()
@@ -901,11 +926,12 @@ def train_single_fold(
         inv_index = build_inverted_index(Y_tr)
         Y_tr_cpu = (Y_tr > 0.5).cpu().numpy()
 
-    tail_mask, level_mask = build_tail_level_masks(
-        Y_tr, cfg.tail_percentile, cfg.level_threshold, label_levels
+    tail_mask_strict, tail_mask_mild, level_mask = build_tail_level_masks(
+        Y_tr, cfg.tail_percentile_strict, cfg.tail_percentile_mild, cfg.level_threshold, label_levels
     )
     sample_weights = compute_sample_weights(
-        Y_tr, tail_mask, level_mask, cfg.tail_weight, cfg.level_weight
+        Y_tr, tail_mask_strict, tail_mask_mild, level_mask,
+        cfg.tail_weight_strict, cfg.tail_weight_mild, cfg.level_weight
     ).clamp_min(1e-6)
     weight_tensor = (sample_weights / sample_weights.sum()).to(torch.float32)
 
@@ -1413,11 +1439,12 @@ def train_full_model(
         inv_index = build_inverted_index(Y_train_full)
         Y_tr_cpu = (Y_train_full > 0.5).cpu().numpy()
 
-    tail_mask, level_mask = build_tail_level_masks(
-        Y_tr, cfg.tail_percentile, cfg.level_threshold, label_levels
+    tail_mask_strict, tail_mask_mild, level_mask = build_tail_level_masks(
+        Y_tr, cfg.tail_percentile_strict, cfg.tail_percentile_mild, cfg.level_threshold, label_levels
     )
     sample_weights = compute_sample_weights(
-        Y_tr, tail_mask, level_mask, cfg.tail_weight, cfg.level_weight
+        Y_tr, tail_mask_strict, tail_mask_mild, level_mask,
+        cfg.tail_weight_strict, cfg.tail_weight_mild, cfg.level_weight
     ).clamp_min(1e-6)
     weight_tensor = (sample_weights / sample_weights.sum()).to(torch.float32)
 
