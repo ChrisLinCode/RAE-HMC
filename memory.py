@@ -77,6 +77,7 @@ class SemanticMemory:
         self.L: int = 0
         self.d: int = 0
         self._built: bool = False
+        self._scale: float = 1.0
 
     # ---------- Build ----------
     def build(self, X: Tensor, Z: Tensor, Y: Tensor, rho: Optional[float] = None) -> None:
@@ -97,6 +98,7 @@ class SemanticMemory:
 
         self.N, self.L, self.d = N, L, d1
         rho_val = cfg.rho if rho is None else float(rho)
+        self._scale = max(rho_val, 1.0 - rho_val)
 
         if not cfg.assume_normalized:
             X = F.normalize(X, p=2, dim=-1)
@@ -144,7 +146,9 @@ class SemanticMemory:
         alpha = torch.softmax(logits, dim=-1)    # [B,b]
 
         V_neighbors = self.V_gpu.index_select(0, nn_idx.view(-1)).view(B, b, self.L)
-        S_mem = torch.bmm(alpha.unsqueeze(1), V_neighbors).squeeze(1).clamp(min=0.0)  # [B,L]
+        S_mem = torch.bmm(alpha.unsqueeze(1), V_neighbors).squeeze(1)  # [B,L]
+        scale = max(self._scale, 1e-6)
+        S_mem = (S_mem / scale).clamp(min=0.0, max=1.0)
         return S_mem
 
     # ---------- Persistence ----------

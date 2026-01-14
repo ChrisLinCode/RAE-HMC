@@ -103,7 +103,7 @@ def main():
 
     # 讀 ann.csv 並生成 rows
     rows = []
-    leaf_counts = Counter()
+    label_counts = Counter()
     try:
         with open(args.ann, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
@@ -135,8 +135,7 @@ def main():
                     if name != ROOT and (name not in parent and name not in children):
                         raise ValueError(f"標註的節點「{name}」不存在於階層樹中。")
                 for name in leaf_names:
-                    if name != ROOT and len(children.get(name, [])) == 0:
-                        leaf_counts[name] += 1
+                    label_counts[name] += 1
 
                 # 展開為 Root→…→leaf 的完整路徑（若標到中層也可）
                 path_lists = []
@@ -184,10 +183,12 @@ def main():
                 writer.writerow(r)
         print(f"[OK] 已輸出 {args.out}（UTF-8, 逗號分隔, 雙引號包裹）。")
         print(f"[INFO] 總筆數：{len(rows)}")
-        if leaf_counts:
-            print("[INFO] Leaf node counts (descending):")
-            for idx, (label, count) in enumerate(leaf_counts.most_common(), start=1):
-                print(f"  {idx}. {label}: {count}")
+        if label_counts:
+            print("[INFO] Label counts (descending):")
+            for idx, (label, count) in enumerate(label_counts.most_common(), start=1):
+                is_leaf = (label != ROOT) and (len(children.get(label, [])) == 0)
+                label_display = label if is_leaf else f"{label}*"
+                print(f"  {idx}. {label_display}: {count}")
     except Exception as e:
         print(f"[ERROR] 寫出 {args.out} 失敗：{e}", file=sys.stderr)
         sys.exit(1)

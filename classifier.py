@@ -61,13 +61,10 @@ class LossConfig:
     # Sample-sample contrastive
     weight_sample_contrast: Optional[float] = None
     tau_sample_contrast: Optional[float] = None
-    use_sample_projector: Optional[bool] = None
     use_sample_loss: Optional[bool] = None
-    num_neg_sample: Optional[int] = None
     sample_repeat: Optional[int] = None
     sample_queue_size: Optional[int] = None
     exclude_same_level_overlap_neg: Optional[bool] = None
-    average_sample_pos_neg_together: Optional[bool] = None
 
     # Optional class weights
     pos_weight: Optional[Tensor] = None
@@ -89,12 +86,9 @@ class LossConfig:
             "weight_sample_contrast": self.weight_sample_contrast,
             "tau_sample_contrast": self.tau_sample_contrast,
             "use_sample_loss": self.use_sample_loss,
-            "num_neg_sample": self.num_neg_sample,
             "sample_repeat": self.sample_repeat,
             "sample_queue_size": self.sample_queue_size,
             "exclude_same_level_overlap_neg": self.exclude_same_level_overlap_neg,
-            "average_sample_pos_neg_together": self.average_sample_pos_neg_together,
-            "use_sample_projector": self.use_sample_projector,
             "path_on_local": self.path_on_local,
         }
         missing = [k for k, v in required.items() if v is None]
@@ -401,25 +395,23 @@ def sample_contrastive_loss(
     Y: Tensor,            # [B, L]
     label_levels: Optional[List[int]] = None,
     temperature: float = 0.07,
-    num_neg_per_label: Optional[int] = None,  # None -> use all negatives in pool
     repeat_times: int = 1,  # sampling rounds per batch
     queue_feats: Optional[Tensor] = None,     # [Q, d] optional FIFO queue embeddings (normalized)
     queue_labels: Optional[Tensor] = None,    # [Q, L] labels for queue entries
     exclude_anchor_overlap: bool = False,     # if True, drop negatives sharing anchor's other same-level labels
-    average_pos_neg_together: bool = False,   # if True, avg all log-probs together; else pos/neg averaged separately
     extra_pool_feats: Optional[Tensor] = None,   # [E, d] optional extra samples (e.g., from inverted index)
     extra_pool_labels: Optional[Tensor] = None,  # [E, L] labels for extra samples
+    extra_pos_candidates_map: Optional[List[Dict[int, List[int]]]] = None,  # per-anchor label->pos indices
 ) -> Tensor:
     """
     Sample-sample contrastive loss (HMCL-like, BCE on sigmoid similarities).
     Level-wise + label-wise sampling:
       * For each anchor sample and each active label j (level l):
           - Positives: 1 sample (uniform) that also has label j (same layer).
-          - Negatives: per label draw K (=num_neg_per_label) samples that (i) do NOT have label j,
-                       (ii) have at least one label in the same level l；若同層無候選則跳過該標籤。
-                       不重複抽樣（池子不足就用全部）。
+          - Negatives: 1 sample that (i) does NOT have label j,
+                       (ii) has at least one label in the same level l.
       * Optionally repeat the sampling repeat_times to enlarge contrastive pairs (paper appendix).
-      * Loss per label j: -mean(logsigmoid(sim_pos/τ)) - mean(logsigmoid(-sim_neg/τ))
+      * Loss per label j: -mean(logsigmoid(sim_pos/?)) - mean(logsigmoid(-sim_neg/?))
     """
     device = h_x.device
     B, L = Y.shape
@@ -431,13 +423,20 @@ def sample_contrastive_loss(
 
     h_norm = F.normalize(h_x, p=2, dim=-1)
 
+    use_direct_pos = extra_pos_candidates_map is not None
     # Positive pool: only extra positives (e.g., inverted index); do not include current batch
-    if extra_pool_feats is not None and extra_pool_labels is not None and extra_pool_feats.numel() > 0:
+    if extra_pool_feats is not None and extra_pool_feats.numel() > 0:
         pos_pool_feats = F.normalize(extra_pool_feats, p=2, dim=-1)
-        pos_pool_labels = extra_pool_labels
     else:
         pos_pool_feats = h_norm.new_zeros((0, h_norm.size(1)))
-        pos_pool_labels = Y.new_zeros((0, Y.size(1)))
+    if not use_direct_pos:
+        if extra_pool_labels is not None and extra_pool_labels.numel() > 0:
+            pos_pool_labels = extra_pool_labels
+        else:
+            pos_pool_labels = Y.new_zeros((0, Y.size(1)))
+    else:
+        if pos_pool_feats.numel() == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True)
 
     # Negative pool: current batch + optional queue (detach queue to avoid grads)
     neg_pool_feats = h_norm
@@ -462,56 +461,65 @@ def sample_contrastive_loss(
             active_labels = (Y[i] > 0.5).nonzero(as_tuple=False).flatten().tolist()
             if not active_labels:
                 continue
+            active_label_set = set(active_labels)
             for j in active_labels:
                 lvl = label_levels[j]
                 lvl_labels = level_to_labels.get(lvl, [])
 
                 # Positive: one sample sharing label j from inverted-index pool
-                pos_mask = (pos_pool_labels[:, j] > 0.5)
-                if pos_mask.sum() == 0:
-                    continue
-                pos_idx_all = pos_mask.nonzero(as_tuple=False).squeeze(1)
-                pos_idx = pos_idx_all[torch.randint(0, pos_idx_all.numel(), (1,))]
+                if use_direct_pos:
+                    pos_map = extra_pos_candidates_map[i] if (extra_pos_candidates_map is not None and i < len(extra_pos_candidates_map)) else None
+                    if not pos_map:
+                        continue
+                    pos_indices = pos_map.get(j, None)
+                    if not pos_indices:
+                        continue
+                    pick = int(torch.randint(0, len(pos_indices), (1,), device=device).item())
+                    pos_idx = pos_indices[pick]
+                    pos_vec = pos_pool_feats[pos_idx:pos_idx+1]
+                else:
+                    pos_mask = (pos_pool_labels[:, j] > 0.5)
+                    if pos_mask.sum() == 0:
+                        continue
+                    pos_idx_all = pos_mask.nonzero(as_tuple=False).squeeze(1)
+                    pos_idx = pos_idx_all[torch.randint(0, pos_idx_all.numel(), (1,))]
+                    pos_vec = pos_pool_feats[pos_idx]
 
-                # Negative: for this label, draw K samples that lack j and have some label in level l
-                lvl_active_mask = (neg_pool_labels[:, lvl_labels].sum(dim=1) > 0)
-                base_neg_mask = (idx_neg_all != i) & (neg_pool_labels[:, j] < 0.5) & lvl_active_mask
+                # Negative: choose a negative label from the same level, then sample a negative instance.
+                overlap_mask = None
                 if exclude_anchor_overlap:
                     anchor_same_level = (Y[i, lvl_labels] > 0.5)
                     overlap_mask = ((neg_pool_labels[:, lvl_labels] > 0.5) & anchor_same_level.unsqueeze(0)).any(dim=1)
-                    base_neg_mask = base_neg_mask & (~overlap_mask)
-                if base_neg_mask.sum() == 0:
-                    # still none -> skip this label
+
+                neg_label_indices: List[Tensor] = []
+                for k in lvl_labels:
+                    if k == j or k in active_label_set:
+                        continue
+                    cand_mask = (neg_pool_labels[:, k] > 0.5) & (neg_pool_labels[:, j] < 0.5) & (idx_neg_all != i)
+                    if overlap_mask is not None:
+                        cand_mask = cand_mask & (~overlap_mask)
+                    if cand_mask.sum() == 0:
+                        continue
+                    neg_label_indices.append(cand_mask.nonzero(as_tuple=False).squeeze(1))
+
+                if not neg_label_indices:
                     continue
-                neg_pool = base_neg_mask.nonzero(as_tuple=False).squeeze(1)
 
                 q = h_norm[i:i+1]                  # [1, d]
-                pos_vec = pos_pool_feats[pos_idx]  # [1, d]
                 sim_pos = (q @ pos_vec.t()).squeeze(0) / temperature  # scalar
                 all_pos_terms.append(sim_pos)
 
-                # draw negatives; allow repeats when K is specified
-                if num_neg_per_label is None:
-                    idx_sampled = neg_pool  # all negatives, unique
-                else:
-                    k_limit = max(1, num_neg_per_label)
-                    perm = torch.randint(0, neg_pool.numel(), (k_limit,), device=device)
-                    idx_sampled = neg_pool[perm]  # may repeat indices
-                for idx_pick in idx_sampled:
-                    neg_vec = neg_pool_feats[idx_pick:idx_pick+1]  # [1, d]
-                    sim_neg = (q @ neg_vec.t()).squeeze(0) / temperature
-                    all_neg_terms.append(sim_neg)
+                # draw one negative (1:1) from same-level negative labels
+                num_neg_labels = len(neg_label_indices)
+                label_pick = int(torch.randint(0, num_neg_labels, (1,), device=device).item())
+                cand_indices = neg_label_indices[label_pick]
+                idx_pick = cand_indices[torch.randint(0, cand_indices.numel(), (1,), device=device)]
+                neg_vec = neg_pool_feats[idx_pick:idx_pick+1]  # [1, d]
+                sim_neg = (q @ neg_vec.t()).squeeze(0) / temperature
+                all_neg_terms.append(sim_neg)
 
     if not all_pos_terms and not all_neg_terms:
         return torch.tensor(0.0, device=device, requires_grad=True)
-    if average_pos_neg_together:
-        terms: List[Tensor] = []
-        if all_pos_terms:
-            terms.append(F.logsigmoid(torch.cat(all_pos_terms)))
-        if all_neg_terms:
-            terms.append(F.logsigmoid(-torch.cat(all_neg_terms)))
-        return -torch.cat(terms).mean()
-
     loss = torch.tensor(0.0, device=device, requires_grad=True)
     if all_pos_terms:
         pos_cat = torch.cat(all_pos_terms)
@@ -539,15 +547,6 @@ class JointLossCombiner(nn.Module):
             self.label_loss_fn = HierarchicalContrastiveLoss(temperature=self.loss.tau_label, num_neg=32)
         else:
             self.label_loss_fn = None  # user can set later
-        # Sample projector for sample_contrast (optional)
-        if getattr(self.loss, "use_sample_projector", False):
-            self.sample_projector = nn.Sequential(
-                nn.Linear(cfg.hidden_size, cfg.hidden_size),
-                nn.GELU(),
-                nn.LayerNorm(cfg.hidden_size),
-            )
-        else:
-            self.sample_projector = nn.Identity()
         # FIFO queue for sample contrast (optional)
         self.sample_queue_feats: Optional[Tensor] = None
         self.sample_queue_labels: Optional[Tensor] = None
@@ -574,6 +573,7 @@ class JointLossCombiner(nn.Module):
         # Optional extra positives for sample contrast (e.g., from inverted index)
         extra_pos_feats: Optional[Tensor] = None,   # [E, d]
         extra_pos_labels: Optional[Tensor] = None,  # [E, L]
+        extra_pos_candidates_map: Optional[List[Dict[int, List[int]]]] = None,  # per-anchor label->pos indices
     ) -> Dict[str, Tensor]:
         # Primary classification loss: always focal (can be disabled via use_bce_loss=False)
         if getattr(self.loss, "use_bce_loss", True):
@@ -621,26 +621,22 @@ class JointLossCombiner(nn.Module):
         # Sample-sample contrast (optional, can be disabled via use_sample_loss)
         loss_sample = torch.tensor(0.0, device=p_cls.device, requires_grad=True)
         if getattr(self.loss, "use_sample_loss", True) and getattr(self.loss, "weight_sample_contrast", 0.0) != 0:
-            h_x_for_contrast = self.sample_projector(h_x)
-            h_x_for_contrast = F.normalize(h_x_for_contrast, p=2, dim=-1)
+            h_x_for_contrast = F.normalize(h_x, p=2, dim=-1)
             extra_pool_feats = extra_pos_feats
             if extra_pool_feats is not None and extra_pool_feats.numel() > 0:
-                # Keep positive/negative pools in the same space. When the projector is enabled,
-                # anchors are projected; project extra positives too to avoid embedding-space mismatch.
-                extra_pool_feats = self.sample_projector(extra_pool_feats)
+                # Keep positive/negative pools in the same space.
                 extra_pool_feats = F.normalize(extra_pool_feats, p=2, dim=-1)
             loss_sample = sample_contrastive_loss(
                 h_x_for_contrast, Y,
                 label_levels=label_levels,
                 temperature=self.loss.tau_sample_contrast,
-                num_neg_per_label=(None if getattr(self.loss, "num_neg_sample", None) is None else max(1, int(self.loss.num_neg_sample))),
                 repeat_times=max(1, int(getattr(self.loss, "sample_repeat", 1))),
                 queue_feats=self.sample_queue_feats,
                 queue_labels=self.sample_queue_labels,
                 exclude_anchor_overlap=getattr(self.loss, "exclude_same_level_overlap_neg", False),
-                average_pos_neg_together=getattr(self.loss, "average_sample_pos_neg_together", False),
                 extra_pool_feats=extra_pool_feats,
                 extra_pool_labels=extra_pos_labels,
+                extra_pos_candidates_map=extra_pos_candidates_map,
             )
             if not torch.isfinite(loss_sample):
                 loss_sample = torch.tensor(0.0, device=p_cls.device)
@@ -712,7 +708,6 @@ if __name__ == "__main__":
         level_sizes=level_sizes,
         dropout=0.0,
         use_local_branch=True,
-        average_sample_pos_neg_together=False,
         device=device,
         loss=LossConfig(
             focal_alpha=0.7,
@@ -730,13 +725,10 @@ if __name__ == "__main__":
             weight_path=1.0,
             weight_sample_contrast=0.1,
             tau_sample_contrast=0.07,
-            use_sample_projector=False,
             use_sample_loss=True,
-            num_neg_sample=4,
             sample_repeat=1,
             sample_queue_size=0,
             exclude_same_level_overlap_neg=False,
-            average_sample_pos_neg_together=False,
         ),
     )
 
