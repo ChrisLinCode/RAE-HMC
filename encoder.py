@@ -171,11 +171,11 @@ class SharedEncoder(nn.Module):
 class HierarchicalContrastiveLoss(nn.Module):
     """
     InfoNCE-style loss on label embeddings to enforce hierarchical geometry (§3.3).
-    Positive pairs are (parent, child) edges; negatives are sampled from non-anc/desc nodes.
+    Positive pairs are (parent, child) edges; negatives are sampled from same-level labels.
     Inputs:
         Z:        [L, d] label embedding matrix (L2-normalized recommended)
         edges:    list of (p_idx, c_idx) for parent→child
-        same_level_map (optional): dict[level] -> List[label_indices] to restrict negatives
+        same_level_map (optional): dict[level] -> List[label_indices] to sample same-level negatives
         temperature: τ_h
         num_neg:  negatives per positive (if None, use all from candidate set)
     """
@@ -191,16 +191,14 @@ class HierarchicalContrastiveLoss(nn.Module):
         edges: List[Tuple[int, int]],
         same_level_map: Optional[Dict[int, List[int]]] = None,
         label_levels: Optional[List[int]] = None,
-        forbid_relatives: Optional[Dict[int, set]] = None,
         num_neg: Optional[int] = None,
     ) -> Tensor:
         """
         Args:
             Z: [L, d]
             edges: list of (p, c)
-            same_level_map: {level: [indices]} if you want negatives from same level
+            same_level_map: {level: [indices]} to sample negatives from same level only
             label_levels: list length L with level index for each label
-            forbid_relatives: precomputed {i: set(j)} of ancestors/descendants/siblings to exclude
         """
         device = Z.device
         if Z.ndim != 2:
@@ -214,17 +212,13 @@ class HierarchicalContrastiveLoss(nn.Module):
             pos = sims[p, c] / self.t
 
             # build negatives
-            if same_level_map is not None and label_levels is not None:
+            if same_level_map is None or label_levels is None:
+                candidates = []
+            else:
                 lvl = label_levels[p]
                 candidates = same_level_map.get(lvl, [])
-            else:
-                candidates = list(range(L))
 
-            if forbid_relatives is not None:
-                bad = forbid_relatives.get(c, set()) | {c, p}
-                neg_candidates = [j for j in candidates if j not in bad]
-            else:
-                neg_candidates = [j for j in candidates if j not in (c, p)]
+            neg_candidates = [j for j in candidates if j not in (c, p)]
 
             if len(neg_candidates) == 0:
                 continue
