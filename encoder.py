@@ -171,7 +171,7 @@ class SharedEncoder(nn.Module):
 class HierarchicalContrastiveLoss(nn.Module):
     """
     InfoNCE-style loss on label embeddings to enforce hierarchical geometry (§3.3).
-    Positive pairs are (parent, child) edges; negatives are sampled from same-level labels.
+    Positive pairs are (child -> parent) edges; negatives can be provided by label-specific pools.
     Inputs:
         Z:        [L, d] label embedding matrix (L2-normalized recommended)
         edges:    list of (p_idx, c_idx) for parent→child
@@ -192,13 +192,15 @@ class HierarchicalContrastiveLoss(nn.Module):
         same_level_map: Optional[Dict[int, List[int]]] = None,
         label_levels: Optional[List[int]] = None,
         num_neg: Optional[int] = None,
+        neg_candidates_by_label: Optional[object] = None,
     ) -> Tensor:
         """
         Args:
             Z: [L, d]
-            edges: list of (p, c)
-            same_level_map: {level: [indices]} to sample negatives from same level only
-            label_levels: list length L with level index for each label
+        edges: list of (p, c) for parent/child
+        same_level_map: {level: [indices]} to sample negatives from same level only
+        label_levels: list length L with level index for each label
+        neg_candidates_by_label: optional per-label negative pools (prefer over same_level_map)
         """
         device = Z.device
         if Z.ndim != 2:
@@ -208,29 +210,49 @@ class HierarchicalContrastiveLoss(nn.Module):
         sims = Z @ Z.t()  # [L, L], cosine if Z normalized
         loss_terms: List[Tensor] = []
 
+        neg_pool = None
+        neg_lengths = None
+        if isinstance(neg_candidates_by_label, tuple) and len(neg_candidates_by_label) == 2:
+            neg_pool, neg_lengths = neg_candidates_by_label
+            if neg_pool.device != device:
+                neg_pool = neg_pool.to(device)
+            if neg_lengths.device != device:
+                neg_lengths = neg_lengths.to(device)
+
         for p, c in edges:
-            pos = sims[p, c] / self.t
+            anchor = c
+            pos = sims[anchor, p] / self.t
 
-            # build negatives
-            if same_level_map is None or label_levels is None:
-                candidates = []
-            else:
-                lvl = label_levels[p]
+            # build negatives (prefer explicit candidates)
+            if neg_pool is not None and neg_lengths is not None and anchor < neg_pool.size(0):
+                pool = neg_pool[anchor]
+                pool_len = int(neg_lengths[anchor].item())
+                if pool_len <= 0:
+                    continue
+                num_neg_effective = self.num_neg if num_neg is None else num_neg
+                if num_neg_effective is None or pool_len <= num_neg_effective:
+                    neg_candidates = pool[:pool_len]
+                else:
+                    max_len = pool.size(0)
+                    rand = torch.randint(0, max_len, (num_neg_effective,), device=device)
+                    rand = rand % pool_len
+                    neg_candidates = pool.gather(0, rand)
+            elif neg_candidates_by_label is not None and anchor < len(neg_candidates_by_label):
+                candidates = neg_candidates_by_label[anchor]
+                neg_candidates = [j for j in candidates if j not in (anchor, p)]
+                neg_candidates = torch.tensor(neg_candidates, device=device, dtype=torch.long) if neg_candidates else None
+            elif same_level_map is not None and label_levels is not None and anchor < len(label_levels):
+                lvl = label_levels[anchor]
                 candidates = same_level_map.get(lvl, [])
+                neg_candidates = [j for j in candidates if j not in (anchor, p)]
+                neg_candidates = torch.tensor(neg_candidates, device=device, dtype=torch.long) if neg_candidates else None
+            else:
+                neg_candidates = None
 
-            neg_candidates = [j for j in candidates if j not in (c, p)]
-
-            if len(neg_candidates) == 0:
+            if neg_candidates is None or neg_candidates.numel() == 0:
                 continue
 
-            num_neg_effective = self.num_neg if num_neg is None else num_neg
-            if num_neg_effective is not None and len(neg_candidates) > num_neg_effective:
-                idx = torch.randperm(len(neg_candidates), device=device)[: num_neg_effective].cpu().tolist()
-                neg_indices = [neg_candidates[k] for k in idx]
-            else:
-                neg_indices = neg_candidates
-
-            neg = sims[p, torch.tensor(neg_indices, device=device)] / self.t  # [M]
+            neg = sims[anchor, neg_candidates] / self.t  # [M]
             denom = torch.logsumexp(torch.cat([pos.view(1), neg], dim=0), dim=0)
             loss_terms.append(-(pos - denom))
 

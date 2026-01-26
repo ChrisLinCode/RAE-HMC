@@ -97,6 +97,13 @@ class ClassifierConfig:
     global_head_mode: Optional[str] = None       # "linear" or "mlp"
     global_hidden_ratio: Optional[float] = None  # hidden dim = ratio * hidden_size
     global_dropout: Optional[float] = None
+    # Local head config
+    local_head_mlp_from_level: Optional[int] = None  # 1-based; levels < this use linear, >= use MLP
+    local_head_hidden_ratio: Optional[float] = None
+    local_dropout: Optional[float] = None
+    # Fusion config
+    fusion_mode: Optional[str] = None  # "linear" or "mlp"
+    fusion_hidden_ratio: Optional[float] = None
 
     use_local_branch: Optional[bool] = None  # False -> global-only (flat) head
     use_global_branch: Optional[bool] = None  # False -> local-only head
@@ -112,6 +119,14 @@ class ClassifierConfig:
             raise ValueError("ClassifierConfig.global_head_mode must be provided.")
         if self.global_hidden_ratio is None:
             raise ValueError("ClassifierConfig.global_hidden_ratio must be provided.")
+        if self.local_head_mlp_from_level is None:
+            raise ValueError("ClassifierConfig.local_head_mlp_from_level must be provided.")
+        if self.local_head_hidden_ratio is None:
+            raise ValueError("ClassifierConfig.local_head_hidden_ratio must be provided.")
+        if self.fusion_mode is None:
+            raise ValueError("ClassifierConfig.fusion_mode must be provided.")
+        if self.fusion_hidden_ratio is None:
+            raise ValueError("ClassifierConfig.fusion_hidden_ratio must be provided.")
         if self.loss is None:
             raise ValueError("ClassifierConfig.loss must be provided (LossConfig).")
         self.loss.validate()
@@ -154,6 +169,7 @@ class DualBranchHierClassifier(nn.Module):
 
         # Local: hierarchical conditional branch (cross-attention per level)
         if self.use_local_branch:
+            local_drop = cfg.local_dropout if cfg.local_dropout is not None else cfg.dropout
             d = cfg.hidden_size
             num_levels = len(self.level_sizes)
 
@@ -161,12 +177,12 @@ class DualBranchHierClassifier(nn.Module):
             self.local_first = nn.Sequential(
                 nn.Linear(d, d),
                 nn.GELU(),
-                nn.Dropout(cfg.dropout),
+                nn.Dropout(local_drop),
             )
 
             # Levels 2..L: Q = h (root), K/V = h_{l-1}
             self.local_attn = nn.ModuleList([
-                nn.MultiheadAttention(embed_dim=d, num_heads=cfg.local_num_heads, dropout=cfg.dropout, batch_first=True)
+                nn.MultiheadAttention(embed_dim=d, num_heads=cfg.local_num_heads, dropout=local_drop, batch_first=True)
                 for _ in range(max(0, num_levels - 1))
             ])
             self.local_norm = nn.ModuleList([nn.LayerNorm(d) for _ in range(max(0, num_levels - 1))])
@@ -174,21 +190,44 @@ class DualBranchHierClassifier(nn.Module):
                 nn.Sequential(
                     nn.Linear(d, d),
                     nn.GELU(),
-                    nn.Dropout(cfg.dropout),
+                    nn.Dropout(local_drop),
                 ) for _ in range(max(0, num_levels - 1))
             ])
 
-            # Per-level prediction heads
-            self.local_heads = nn.ModuleList([
-                nn.Linear(d, n_l) for n_l in self.level_sizes
-            ])
+            # Per-level prediction heads (linear or MLP)
+            mlp_from_level = int(getattr(cfg, "local_head_mlp_from_level", 1))
+            local_head_hidden = max(1, int(cfg.hidden_size * cfg.local_head_hidden_ratio))
+            self.local_heads = nn.ModuleList()
+            for level_idx, n_l in enumerate(self.level_sizes, start=1):
+                if level_idx >= mlp_from_level:
+                    head = nn.Sequential(
+                        nn.Linear(d, local_head_hidden),
+                        nn.GELU(),
+                        nn.Dropout(local_drop),
+                        nn.Linear(local_head_hidden, n_l),
+                    )
+                else:
+                    head = nn.Linear(d, n_l)
+                self.local_heads.append(head)
         else:
             self.local_heads = nn.ModuleList()
 
-        # Fusion MLP: concat -> MLP -> fused logits
-        self.fusion_mlp = nn.Sequential(
-            nn.Linear(2 * self.L, self.L),
-        )
+        # Fusion: choose linear or shallow MLP on logits concat
+        self.fusion_mode = str(getattr(cfg, "fusion_mode", "linear")).lower().strip()
+        fusion_hidden_ratio = cfg.fusion_hidden_ratio if cfg.fusion_hidden_ratio is not None else 1.0
+        fusion_drop = cfg.dropout if cfg.dropout is not None else 0.0
+        if self.fusion_mode in {"mlp"}:
+            fusion_hidden = max(1, int(2 * self.L * fusion_hidden_ratio))
+            self.fusion_mlp = nn.Sequential(
+                nn.Linear(2 * self.L, fusion_hidden),
+                nn.GELU(),
+                nn.Dropout(fusion_drop),
+                nn.Linear(fusion_hidden, self.L),
+            )
+        else:
+            self.fusion_mlp = nn.Sequential(
+                nn.Linear(2 * self.L, self.L),
+            )
         # Logit-space fusion (residual-style): logits_global + logits_local + linear([logits_local; logits_global])
         self.fusion_linear_logits = nn.Linear(2 * self.L, self.L)
 
@@ -255,7 +294,10 @@ class DualBranchHierClassifier(nn.Module):
             # Original logit-space fusion (allows cross-label mixing via fusion_linear_logits):
             # logits_sum = logits_global + logits_local + Linear([logits_local; logits_global])
             logits_concat = torch.cat([logits_local_concat, logits_global], dim=-1)  # [B, 2L], logits
-            logits_fuse = self.fusion_linear_logits(logits_concat)
+            if self.fusion_mode in {"mlp"}:
+                logits_fuse = self.fusion_mlp(logits_concat)
+            else:
+                logits_fuse = self.fusion_linear_logits(logits_concat)
             logits_sum = logits_global + logits_local_concat + logits_fuse
             p_cls = torch.sigmoid(logits_sum)
         elif self.use_local_branch:
@@ -306,7 +348,7 @@ def alignment_loss(
     h_x: Tensor,
     Z: Tensor,
     pos_indices_per_sample: List[List[int]],
-    candidate_neg_indices: Optional[List[List[int]]] = None,
+    candidate_neg_indices: Optional[object] = None,
     temperature: float = 0.07,
     same_level_map: Optional[Dict[int, List[int]]] = None,
     label_levels: Optional[List[int]] = None,
@@ -327,8 +369,13 @@ def alignment_loss(
             continue
 
         if candidate_neg_indices is not None:
-            neg_idx = [j for j in candidate_neg_indices[i] if j not in pos_idx]
-            if len(neg_idx) == 0:
+            if torch.is_tensor(candidate_neg_indices):
+                neg_idx = candidate_neg_indices[i]
+                neg_idx = neg_idx[neg_idx >= 0]
+            else:
+                neg_idx = [j for j in candidate_neg_indices[i] if j not in pos_idx]
+                neg_idx = torch.tensor(neg_idx, device=device, dtype=torch.long) if neg_idx else None
+            if neg_idx is None or neg_idx.numel() == 0:
                 continue
             sim_pos = (q[i:i+1] @ Z_norm[pos_idx].T).squeeze(0)
             sim_neg = (q[i:i+1] @ Z_norm[neg_idx].T).squeeze(0)
@@ -420,6 +467,8 @@ class JointLossCombiner(nn.Module):
         Z_for_label_loss: Optional[Tensor] = None,   # [L, d], if None -> use Z
         same_level_map: Optional[Dict[int, List[int]]] = None,
         label_levels: Optional[List[int]] = None,
+        label_neg_candidates: Optional[List[List[int]]] = None,
+        candidate_neg_indices: Optional[List[List[int]]] = None,
         p_local: Optional[Tensor] = None,     # [B, L] local branch probs (optional; used for path loss)
     ) -> Dict[str, Tensor]:
         # Primary classification loss: always focal (can be disabled via use_bce_loss=False)
@@ -441,7 +490,7 @@ class JointLossCombiner(nn.Module):
         if getattr(self.loss, "use_align_loss", True) and getattr(self.loss, "weight_align", 0.0) != 0:
             loss_align = alignment_loss(
                 h_x, Z, pos_indices_per_sample,
-                candidate_neg_indices=None,
+                candidate_neg_indices=candidate_neg_indices,
                 temperature=self.loss.tau_align,
                 same_level_map=same_level_map,
                 label_levels=label_levels,
@@ -465,6 +514,7 @@ class JointLossCombiner(nn.Module):
                 same_level_map=same_level_map,
                 label_levels=label_levels,
                 num_neg=label_num_neg,
+                neg_candidates_by_label=label_neg_candidates,
             )
 
         total = loss_bce \
@@ -517,6 +567,12 @@ if __name__ == "__main__":
         dropout=0.0,
         global_head_mode="mlp",
         global_hidden_ratio=1.0,
+        local_head_mlp_from_level=2,
+        local_head_hidden_ratio=0.5,
+        fusion_mode="linear",
+        fusion_hidden_ratio=1.0,
+        global_dropout=None,
+        local_dropout=None,
         use_local_branch=True,
         device=device,
         loss=LossConfig(
@@ -551,6 +607,7 @@ if __name__ == "__main__":
         h_x=h_x,
         Z=Z,
         pos_indices_per_sample=pos_idx,
+        candidate_neg_indices=None,
         edges_parent_child=edges_pc,
         Z_for_label_loss=Z,  # (optional) use same Z
         same_level_map=None,
