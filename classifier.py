@@ -4,11 +4,11 @@
 # - Global branch (flat): logits_global -> sigmoid -> p_global
 # - Local branch (level-wise): per-level heads -> concat logits_local -> p_local
 # - Final classifier score (M3 output): p_cls = sigmoid(logits_global + logits_local)
-# - Losses: Masked BCE / Focal, Alignment Loss, Path Hinge Loss, Label Loss (HCL)
+# - Losses: Masked BCE / Focal, Alignment Loss, Path Hinge Loss
 #
 # NOTE:
 #   * This module outputs classifier-side scores; fusion with memory scores (M2) is done in M4.
-#   * For alignment loss you must provide positive label indices per sample.
+#   * For cl loss you must provide positive label indices per sample.
 #   * For path hinge loss you must provide parent–child edge list.
 
 from __future__ import annotations
@@ -19,12 +19,6 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# Reuse the HCL from M1 (encoder.py) for joint training (per §3.5)
-try:
-    from encoder import HierarchicalContrastiveLoss
-except Exception:
-    HierarchicalContrastiveLoss = None  # Optional: user may choose to import later
 
 
 Tensor = torch.Tensor
@@ -41,23 +35,19 @@ class LossConfig:
     use_bce_loss: bool = True  # master switch: False -> skip BCE/Focal term
 
     # Alignment loss
-    tau_align: Optional[float] = None
-    use_align_loss: Optional[bool] = None
+    tau_cl: Optional[float] = None
+    use_cl_loss: Optional[bool] = None
+    use_inbatch_sample_neg_cl: bool = False
 
-    # Label contrastive loss (formerly HCL)
-    tau_label: Optional[float] = None
-    num_neg_align: Optional[int] = None
-    num_neg_label: Optional[int] = None
-    use_label_loss: Optional[bool] = None
+    num_neg_cl: Optional[int] = None
 
     # Path loss
     weight_path: Optional[float] = None
     use_path_loss: Optional[bool] = None
     path_on_local: Optional[bool] = None  # True -> use p_local; False -> use fused p_cls
 
-    # Align/Path/Label weights
-    weight_label: Optional[float] = None
-    weight_align: Optional[float] = None
+    # Align/Path weights
+    weight_cl: Optional[float] = None
 
     # Optional class weights
     pos_weight: Optional[Tensor] = None
@@ -65,17 +55,13 @@ class LossConfig:
 
     def validate(self):
         required = {
-            "tau_align": self.tau_align,
-            "tau_label": self.tau_label,
-            "num_neg_align": self.num_neg_align,
-            "num_neg_label": self.num_neg_label,
-            "use_align_loss": self.use_align_loss,
-            "use_label_loss": self.use_label_loss,
+            "tau_cl": self.tau_cl,
+            "num_neg_cl": self.num_neg_cl,
+            "use_cl_loss": self.use_cl_loss,
             "use_path_loss": self.use_path_loss,
             "focal_alpha": self.focal_alpha,
             "focal_gamma": self.focal_gamma,
-            "weight_label": self.weight_label,
-            "weight_align": self.weight_align,
+            "weight_cl": self.weight_cl,
             "weight_path": self.weight_path,
             "path_on_local": self.path_on_local,
         }
@@ -92,17 +78,16 @@ class ClassifierConfig:
     hidden_size: int               # d, typically 768
     level_sizes: List[int]         # e.g., [L1, L2, L3, L4]
     dropout: Optional[float] = None           # optional dropout on h_x before heads
-    local_num_heads: int = 2       # multi-head attention heads for conditional local branch
-    # Global head config
-    global_head_mode: Optional[str] = None       # "linear" or "mlp"
+    local_num_heads: Optional[int] = None  # multi-head attention heads for conditional local branch
+    # Global head config (fixed to MLP)
     global_hidden_ratio: Optional[float] = None  # hidden dim = ratio * hidden_size
     global_dropout: Optional[float] = None
     # Local head config
     local_head_mlp_from_level: Optional[int] = None  # 1-based; levels < this use linear, >= use MLP
     local_head_hidden_ratio: Optional[float] = None
     local_dropout: Optional[float] = None
-    # Fusion config
-    fusion_mode: Optional[str] = None  # "linear" or "mlp"
+    local_attn_mode: Optional[str] = None  # "prev_only" or "label_kv"
+    # Fusion config (fixed to MLP)
     fusion_hidden_ratio: Optional[float] = None
 
     use_local_branch: Optional[bool] = None  # False -> global-only (flat) head
@@ -115,16 +100,14 @@ class ClassifierConfig:
     def __post_init__(self):
         if self.dropout is None:
             raise ValueError("ClassifierConfig.dropout must be provided.")
-        if self.global_head_mode is None:
-            raise ValueError("ClassifierConfig.global_head_mode must be provided.")
         if self.global_hidden_ratio is None:
             raise ValueError("ClassifierConfig.global_hidden_ratio must be provided.")
         if self.local_head_mlp_from_level is None:
             raise ValueError("ClassifierConfig.local_head_mlp_from_level must be provided.")
         if self.local_head_hidden_ratio is None:
             raise ValueError("ClassifierConfig.local_head_hidden_ratio must be provided.")
-        if self.fusion_mode is None:
-            raise ValueError("ClassifierConfig.fusion_mode must be provided.")
+        if self.local_attn_mode is None:
+            raise ValueError("ClassifierConfig.local_attn_mode must be provided.")
         if self.fusion_hidden_ratio is None:
             raise ValueError("ClassifierConfig.fusion_hidden_ratio must be provided.")
         if self.loss is None:
@@ -154,24 +137,22 @@ class DualBranchHierClassifier(nn.Module):
         self.dropout = nn.Dropout(cfg.dropout) if cfg.dropout > 0 else nn.Identity()
 
         # Global: linear or 1-hidden-layer MLP (flat, hierarchy-agnostic)
-        global_mode = str(getattr(cfg, "global_head_mode", "mlp")).lower().strip()
-        if global_mode in {"linear", "lin"}:
-            self.global_head = nn.Linear(cfg.hidden_size, self.L)
-        else:
-            global_hidden = max(1, int(cfg.hidden_size * cfg.global_hidden_ratio))
-            global_drop = cfg.global_dropout if cfg.global_dropout is not None else cfg.dropout
-            self.global_head = nn.Sequential(
-                nn.Linear(cfg.hidden_size, global_hidden),
-                nn.GELU(),
-                nn.Dropout(global_drop),
-                nn.Linear(global_hidden, self.L),
-            )
+        global_hidden = max(1, int(cfg.hidden_size * cfg.global_hidden_ratio))
+        global_drop = cfg.global_dropout if cfg.global_dropout is not None else cfg.dropout
+        self.global_head = nn.Sequential(
+            nn.Linear(cfg.hidden_size, global_hidden),
+            nn.GELU(),
+            nn.Dropout(global_drop),
+            nn.Linear(global_hidden, self.L),
+        )
 
         # Local: hierarchical conditional branch (cross-attention per level)
         if self.use_local_branch:
             local_drop = cfg.local_dropout if cfg.local_dropout is not None else cfg.dropout
+            local_heads = cfg.local_num_heads if cfg.local_num_heads is not None else 1
             d = cfg.hidden_size
             num_levels = len(self.level_sizes)
+            self.local_attn_mode = str(getattr(cfg, "local_attn_mode", "prev_only")).lower().strip()
 
             # Level-1 representation: MLP(h)
             self.local_first = nn.Sequential(
@@ -182,16 +163,16 @@ class DualBranchHierClassifier(nn.Module):
 
             # Levels 2..L: Q = h (root), K/V = h_{l-1}
             self.local_attn = nn.ModuleList([
-                nn.MultiheadAttention(embed_dim=d, num_heads=cfg.local_num_heads, dropout=local_drop, batch_first=True)
-                for _ in range(max(0, num_levels - 1))
+                nn.MultiheadAttention(embed_dim=d, num_heads=local_heads, dropout=local_drop, batch_first=True)
+                for _ in range(max(0, num_levels))
             ])
-            self.local_norm = nn.ModuleList([nn.LayerNorm(d) for _ in range(max(0, num_levels - 1))])
+            self.local_norm = nn.ModuleList([nn.LayerNorm(d) for _ in range(max(0, num_levels))])
             self.local_ff = nn.ModuleList([
                 nn.Sequential(
                     nn.Linear(d, d),
                     nn.GELU(),
                     nn.Dropout(local_drop),
-                ) for _ in range(max(0, num_levels - 1))
+                ) for _ in range(max(0, num_levels))
             ])
 
             # Per-level prediction heads (linear or MLP)
@@ -213,24 +194,15 @@ class DualBranchHierClassifier(nn.Module):
             self.local_heads = nn.ModuleList()
 
         # Fusion: choose linear or shallow MLP on logits concat
-        self.fusion_mode = str(getattr(cfg, "fusion_mode", "linear")).lower().strip()
         fusion_hidden_ratio = cfg.fusion_hidden_ratio if cfg.fusion_hidden_ratio is not None else 1.0
         fusion_drop = cfg.dropout if cfg.dropout is not None else 0.0
-        if self.fusion_mode in {"mlp"}:
-            fusion_hidden = max(1, int(2 * self.L * fusion_hidden_ratio))
-            self.fusion_mlp = nn.Sequential(
-                nn.Linear(2 * self.L, fusion_hidden),
-                nn.GELU(),
-                nn.Dropout(fusion_drop),
-                nn.Linear(fusion_hidden, self.L),
-            )
-        else:
-            self.fusion_mlp = nn.Sequential(
-                nn.Linear(2 * self.L, self.L),
-            )
-        # Logit-space fusion (residual-style): logits_global + logits_local + linear([logits_local; logits_global])
-        self.fusion_linear_logits = nn.Linear(2 * self.L, self.L)
-
+        fusion_hidden = max(1, int(2 * self.L * fusion_hidden_ratio))
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(2 * self.L, fusion_hidden),
+            nn.GELU(),
+            nn.Dropout(fusion_drop),
+            nn.Linear(fusion_hidden, self.L),
+        )
         self.level_slices = None
         if self.use_local_branch and getattr(cfg, "level_slices", None) is not None:
             # cached indices for index_copy
@@ -238,7 +210,7 @@ class DualBranchHierClassifier(nn.Module):
 
         self.to(cfg.device)
 
-    def forward(self, h_x: Tensor) -> Dict[str, Tensor]:
+    def forward(self, h_x: Tensor, label_embeds: Optional[Tensor] = None) -> Dict[str, Tensor]:
         """
         Args:
             h_x: [B, d] shared encoder output (query embedding)
@@ -255,21 +227,43 @@ class DualBranchHierClassifier(nn.Module):
             # Local (hierarchical conditional)
             h_levels: List[Tensor] = []
 
-            # Level 1 representation
-            h1 = self.local_first(h)                    # [B, d]
-            h_levels.append(h1)
+            # Level 1 base representation
+            h_prev = self.local_first(h)                    # [B, d]
 
-            # Levels 2..: cross-attention with root query
-            for idx in range(len(self.level_sizes) - 1):
-                if idx >= len(self.local_attn):
-                    break
-                q = h.unsqueeze(1)                       # [B,1,d]
-                kv = h_levels[-1].unsqueeze(1)          # [B,1,d]
-                attn_out, _ = self.local_attn[idx](q, kv, kv)  # [B,1,d]
-                attn_out = attn_out.squeeze(1)          # [B,d]
-                attn_out = self.local_norm[idx](attn_out + h)  # residual on query
-                h_next = self.local_ff[idx](attn_out)   # [B,d]
-                h_levels.append(h_next)
+            if self.local_attn_mode == "label_kv" and label_embeds is not None and self.level_slices is not None:
+                Z = label_embeds
+                if Z.device != h.device:
+                    Z = Z.to(h.device)
+                for lvl_idx, lvl_ids in enumerate(self.level_slices):
+                    if lvl_idx >= len(self.local_attn):
+                        break
+                    if lvl_ids.numel() == 0:
+                        h_levels.append(h_prev)
+                        continue
+                    Z_l = Z.index_select(0, lvl_ids.to(h.device))  # [n_l, d]
+                    q_base = h_prev
+                    q_vec = h + q_base
+                    q = q_vec.unsqueeze(1)                        # [B,1,d]
+                    k = Z_l.unsqueeze(0).expand(h.size(0), -1, -1) # [B,n_l,d]
+                    v = k
+                    attn_out, _ = self.local_attn[lvl_idx](q, k, v)  # [B,1,d]
+                    attn_out = attn_out.squeeze(1)                # [B,d]
+                    attn_out = self.local_norm[lvl_idx](attn_out + q_base)
+                    h_prev = self.local_ff[lvl_idx](attn_out)     # [B,d]
+                    h_levels.append(h_prev)
+            else:
+                # Fallback: single-vector attention (prev-only)
+                h_levels.append(h_prev)
+                for idx in range(len(self.level_sizes) - 1):
+                    if idx >= len(self.local_attn):
+                        break
+                    q = h.unsqueeze(1)                       # [B,1,d]
+                    kv = h_levels[-1].unsqueeze(1)          # [B,1,d]
+                    attn_out, _ = self.local_attn[idx](q, kv, kv)  # [B,1,d]
+                    attn_out = attn_out.squeeze(1)          # [B,d]
+                    attn_out = self.local_norm[idx](attn_out + h)  # residual on query
+                    h_next = self.local_ff[idx](attn_out)   # [B,d]
+                    h_levels.append(h_next)
 
             logits_local_list = [head(h_l) for head, h_l in zip(self.local_heads, h_levels)]  # per-level logits
             # Per-level sigmoid, then concat probabilities (per論文做法)
@@ -291,13 +285,8 @@ class DualBranchHierClassifier(nn.Module):
 
         # Fusion: choose logits- or prob-space fusion based on cfg
         if self.use_local_branch and self.use_global_branch:
-            # Original logit-space fusion (allows cross-label mixing via fusion_linear_logits):
-            # logits_sum = logits_global + logits_local + Linear([logits_local; logits_global])
             logits_concat = torch.cat([logits_local_concat, logits_global], dim=-1)  # [B, 2L], logits
-            if self.fusion_mode in {"mlp"}:
-                logits_fuse = self.fusion_mlp(logits_concat)
-            else:
-                logits_fuse = self.fusion_linear_logits(logits_concat)
+            logits_fuse = self.fusion_mlp(logits_concat)
             logits_sum = logits_global + logits_local_concat + logits_fuse
             p_cls = torch.sigmoid(logits_sum)
         elif self.use_local_branch:
@@ -344,17 +333,21 @@ def focal_loss(
     return loss.sum() / denom
 
 
-def alignment_loss(
+def cl_loss(
     h_x: Tensor,
     Z: Tensor,
     pos_indices_per_sample: List[List[int]],
+    pos_weights_per_sample: Optional[List[List[float]]] = None,
     candidate_neg_indices: Optional[object] = None,
     temperature: float = 0.07,
     same_level_map: Optional[Dict[int, List[int]]] = None,
     label_levels: Optional[List[int]] = None,
+    level_sizes: Optional[List[int]] = None,
     max_negatives: Optional[int] = 64,
+    y_true: Optional[Tensor] = None,
+    use_inbatch_sample_neg: bool = False,
 ) -> Tensor:
-    """InfoNCE-style alignment loss with per-level negative pools."""
+    """InfoNCE-style cl loss with per-level negative pools."""
     device = h_x.device
     B, _ = h_x.shape
     L = Z.shape[0]
@@ -363,10 +356,49 @@ def alignment_loss(
     Z_norm = F.normalize(Z, p=2, dim=-1)
 
     loss_terms: List[Tensor] = []
+    inbatch_neg_mask: Optional[Tensor] = None
+    if use_inbatch_sample_neg and y_true is not None and label_levels is not None:
+        lvl_t = torch.tensor(label_levels, device=device, dtype=torch.long)
+        eff = torch.ones_like(lvl_t, dtype=torch.bool, device=device)
+        if level_sizes is not None:
+            lvl_sizes_t = torch.tensor(level_sizes, device=device, dtype=torch.long)
+            num_levels = lvl_sizes_t.numel()
+            lvl_idx = lvl_t
+            if num_levels > 0 and lvl_t.numel() > 0:
+                if lvl_t.max().item() == num_levels and lvl_t.min().item() >= 1:
+                    lvl_idx = lvl_t - 1
+            valid = (lvl_idx >= 0) & (lvl_idx < num_levels)
+            size_mask = torch.zeros_like(valid, dtype=torch.bool)
+            if valid.any():
+                size_ok = (lvl_sizes_t.index_select(0, lvl_idx[valid]) > 1)
+                size_mask[valid] = size_ok
+            eff = eff & size_mask
+        if eff.any():
+            yb = (y_true > 0.5).to(torch.float32)
+            y_eff = yb[:, eff]
+            overlap = (y_eff @ y_eff.T) > 0
+            valid = (y_eff.sum(dim=1) > 0)
+            inbatch_neg_mask = (~overlap) & valid.unsqueeze(0) & valid.unsqueeze(1)
+            inbatch_neg_mask.fill_diagonal_(False)
+
     for i in range(B):
         pos_idx = pos_indices_per_sample[i]
         if not pos_idx:
             continue
+        weights = None
+        weight_by_label = None
+        if pos_weights_per_sample is not None and i < len(pos_weights_per_sample):
+            w_list = pos_weights_per_sample[i]
+            if w_list and len(w_list) == len(pos_idx):
+                weights = torch.tensor(w_list, device=device, dtype=q.dtype)
+                weight_by_label = {lab: float(w_list[idx]) for idx, lab in enumerate(pos_idx)}
+        sim_neg_parts: List[Tensor] = []
+
+        if inbatch_neg_mask is not None:
+            neg_sample_idx = torch.nonzero(inbatch_neg_mask[i], as_tuple=False).squeeze(-1)
+            if neg_sample_idx.numel() > 0:
+                sim_neg_sample = (q[i:i+1] @ q.index_select(0, neg_sample_idx).T).squeeze(0)
+                sim_neg_parts.append(sim_neg_sample)
 
         if candidate_neg_indices is not None:
             if torch.is_tensor(candidate_neg_indices):
@@ -375,14 +407,18 @@ def alignment_loss(
             else:
                 neg_idx = [j for j in candidate_neg_indices[i] if j not in pos_idx]
                 neg_idx = torch.tensor(neg_idx, device=device, dtype=torch.long) if neg_idx else None
-            if neg_idx is None or neg_idx.numel() == 0:
+            if neg_idx is not None and neg_idx.numel() > 0:
+                sim_neg = (q[i:i+1] @ Z_norm[neg_idx].T).squeeze(0)
+                sim_neg_parts.append(sim_neg)
+            if not sim_neg_parts:
                 continue
             sim_pos = (q[i:i+1] @ Z_norm[pos_idx].T).squeeze(0)
-            sim_neg = (q[i:i+1] @ Z_norm[neg_idx].T).squeeze(0)
-            for sp in sim_pos:
+            sim_neg = torch.cat(sim_neg_parts, dim=0)
+            for sp_idx, sp in enumerate(sim_pos):
+                w = weights[sp_idx] if weights is not None else 1.0
                 num = sp / temperature
                 den = torch.logsumexp(torch.cat([sp.view(1), sim_neg]) / temperature, dim=0)
-                loss_terms.append(-(num - den))
+                loss_terms.append(-(num - den) * w)
             continue
 
         if same_level_map is None or label_levels is None:
@@ -403,11 +439,17 @@ def alignment_loss(
                 base_candidates = random.sample(base_candidates, max_negatives)
 
             sim_pos = (q[i:i+1] @ Z_norm[pos_lvl].T).squeeze(0)
-            sim_neg = (q[i:i+1] @ Z_norm[base_candidates].T).squeeze(0)
-            for sp in sim_pos:
+            sim_neg_parts_lvl = list(sim_neg_parts)
+            sim_neg_parts_lvl.append((q[i:i+1] @ Z_norm[base_candidates].T).squeeze(0))
+            sim_neg = torch.cat(sim_neg_parts_lvl, dim=0)
+            for sp_idx, sp in enumerate(sim_pos):
+                if weight_by_label is not None:
+                    w = weight_by_label.get(pos_lvl[sp_idx], 1.0)
+                else:
+                    w = 1.0
                 num = sp / temperature
                 den = torch.logsumexp(torch.cat([sp.view(1), sim_neg]) / temperature, dim=0)
-                loss_terms.append(-(num - den))
+                loss_terms.append(-(num - den) * w)
 
     if not loss_terms:
         return torch.tensor(0.0, device=device, requires_grad=True)
@@ -437,18 +479,14 @@ def path_hinge_loss(
 # -----------------------------
 class JointLossCombiner(nn.Module):
     """
-    Combine BCE/Focal + λ1*Label + λ2*Align + λ3*Path into total loss (§3.5).
-    Label loss (hierarchical contrast) uses label embeddings Z and parent–child edges.
+    Combine BCE/Focal + Align + Path into total loss (禮3.5).
     Align uses (h_x, Z) with positive label indices per sample.
     """
     def __init__(self, cfg: ClassifierConfig):
         super().__init__()
         self.cfg = cfg
         self.loss = cfg.loss
-        if HierarchicalContrastiveLoss is not None:
-            self.label_loss_fn = HierarchicalContrastiveLoss(temperature=self.loss.tau_label, num_neg=32)
-        else:
-            self.label_loss_fn = None  # user can set later
+
     def forward(
         self,
         # classifier outputs
@@ -456,22 +494,20 @@ class JointLossCombiner(nn.Module):
         # supervision
         Y: Tensor,                            # [B, L]
         mask: Optional[Tensor],               # [B, L] or None
-        # alignment resources
+        # cl resources
         h_x: Tensor,                          # [B, d]
         Z: Tensor,                            # [L, d]
         pos_indices_per_sample: List[List[int]],
         # path resources
         edges_parent_child: List[Tuple[int, int]],
-        # Label contrast resources (optional)
+        pos_weights_per_sample: Optional[List[List[float]]] = None,
+        # misc
         logits_cls: Optional[Tensor] = None,  # [B, L], optional for logit-space focal
-        Z_for_label_loss: Optional[Tensor] = None,   # [L, d], if None -> use Z
         same_level_map: Optional[Dict[int, List[int]]] = None,
         label_levels: Optional[List[int]] = None,
-        label_neg_candidates: Optional[List[List[int]]] = None,
         candidate_neg_indices: Optional[List[List[int]]] = None,
         p_local: Optional[Tensor] = None,     # [B, L] local branch probs (optional; used for path loss)
     ) -> Dict[str, Tensor]:
-        # Primary classification loss: always focal (can be disabled via use_bce_loss=False)
         if getattr(self.loss, "use_bce_loss", True):
             if logits_cls is None:
                 eps = 1e-8
@@ -485,54 +521,39 @@ class JointLossCombiner(nn.Module):
         else:
             loss_bce = torch.tensor(0.0, device=p_cls.device, requires_grad=True)
 
-        # Align
-        loss_align = torch.tensor(0.0, device=p_cls.device, requires_grad=True)
-        if getattr(self.loss, "use_align_loss", True) and getattr(self.loss, "weight_align", 0.0) != 0:
-            loss_align = alignment_loss(
+        loss_cl = torch.tensor(0.0, device=p_cls.device, requires_grad=True)
+        if getattr(self.loss, "use_cl_loss", True) and getattr(self.loss, "weight_cl", 0.0) != 0:
+            loss_cl = cl_loss(
                 h_x, Z, pos_indices_per_sample,
+                pos_weights_per_sample=pos_weights_per_sample,
                 candidate_neg_indices=candidate_neg_indices,
-                temperature=self.loss.tau_align,
+                temperature=self.loss.tau_cl,
                 same_level_map=same_level_map,
                 label_levels=label_levels,
-                max_negatives=self.loss.num_neg_align if getattr(self.loss, "num_neg_align", None) is not None else None,
+                max_negatives=self.loss.num_neg_cl if getattr(self.loss, "num_neg_cl", None) is not None else None,
+                y_true=Y,
+                use_inbatch_sample_neg=getattr(self.loss, "use_inbatch_sample_neg_cl", False),
+                level_sizes=self.cfg.level_sizes,
             )
 
-        # Path hinge
         if getattr(self.loss, "use_path_loss", True) and getattr(self.loss, "weight_path", 0.0) != 0:
-            # Simplified: always apply path constraint on final classifier probabilities p_cls.
             loss_path = path_hinge_loss(p_cls, edges_parent_child)
         else:
             loss_path = torch.tensor(0.0, device=p_cls.device)
 
-        # Label contrast (optional, can be zero if not provided)
-        loss_label = torch.tensor(0.0, device=p_cls.device)
-        if self.label_loss_fn is not None and Z is not None and edges_parent_child and getattr(self.loss, "use_label_loss", True) and getattr(self.loss, "weight_label", 0.0) != 0:
-            label_num_neg = getattr(self.loss, "num_neg_label", None)
-            loss_label = self.label_loss_fn(
-                Z_for_label_loss if Z_for_label_loss is not None else Z,
-                edges_parent_child,
-                same_level_map=same_level_map,
-                label_levels=label_levels,
-                num_neg=label_num_neg,
-                neg_candidates_by_label=label_neg_candidates,
-            )
-
-        total = loss_bce \
-            + self.loss.weight_align * loss_align \
-            + self.loss.weight_path * loss_path \
-            + self.loss.weight_label * loss_label
+        total = loss_bce             + self.loss.weight_cl * loss_cl             + self.loss.weight_path * loss_path
 
         return {
             "loss_total": total,
             "loss_bce": loss_bce.detach(),
-            "loss_align": loss_align.detach(),
+            "loss_cl": loss_cl.detach(),
             "loss_path": loss_path.detach(),
-            "loss_label": loss_label.detach(),
         }
 
 
 # -----------------------------
 # Minimal smoke test (optional)
+
 # -----------------------------
 if __name__ == "__main__":
     torch.manual_seed(42)
@@ -558,18 +579,17 @@ if __name__ == "__main__":
     # Parent-child edges (indices in concatenated label order)
     edges_pc = [(0, 3), (1, 4), (2, 5)]  # parents in L1, children in L2 (toy)
 
-    # Positives per sample for alignment
+    # Positives per sample for cl
     pos_idx = [[0, 4], [1], [2, 5], [6]]
 
     cfg = ClassifierConfig(
         hidden_size=d,
         level_sizes=level_sizes,
         dropout=0.0,
-        global_head_mode="mlp",
         global_hidden_ratio=1.0,
         local_head_mlp_from_level=2,
         local_head_hidden_ratio=0.5,
-        fusion_mode="linear",
+        local_attn_mode="label_kv",
         fusion_hidden_ratio=1.0,
         global_dropout=None,
         local_dropout=None,
@@ -580,15 +600,11 @@ if __name__ == "__main__":
             focal_gamma=0.0,
             use_bce_loss=True,
             path_on_local=True,
-            tau_align=0.07,
-            tau_label=0.07,
-            num_neg_align=16,
-            num_neg_label=16,
-            use_align_loss=True,
-            use_label_loss=True,
+            tau_cl=0.07,
+            num_neg_cl=16,
+            use_cl_loss=True,
             use_path_loss=True,
-            weight_label=1.0,
-            weight_align=1.0,
+            weight_cl=1.0,
             weight_path=1.0,
         ),
     )
@@ -609,7 +625,6 @@ if __name__ == "__main__":
         pos_indices_per_sample=pos_idx,
         candidate_neg_indices=None,
         edges_parent_child=edges_pc,
-        Z_for_label_loss=Z,  # (optional) use same Z
         same_level_map=None,
         label_levels=None,
     )

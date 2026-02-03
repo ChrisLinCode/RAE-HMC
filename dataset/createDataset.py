@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 createDataset.py
@@ -8,11 +8,11 @@ to produce a normalized dataset (`dataset.csv`).
 
 Inputs:
 1) label_hierarchy.json   # Nested dict tree, e.g. {"Root": {"Food": {"Grains": {"Wheat": {}}}}}
-2) ann.csv                # Columns: id,text,leaf_labels (leaf_labels split by ';')
+2) ann.csv                # Columns: text,leaf_labels (leaf_labels split by ';')
 
 Output:
 - dataset.csv  (UTF-8, quoted)
-  columns: id, text, labels
+  columns: text, labels
   labels: union of every node along each leaf path (Root included); entries separated by ';'
 
 Usage:
@@ -79,7 +79,7 @@ def path_to_root(node: str, parent: dict, root: str) -> list:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hier", required=True, help="label_hierarchy.json (中文鍵名)")
-    ap.add_argument("--ann", required=True, help="ann.csv（id,text,leaf_labels）")
+    ap.add_argument("--ann", required=True, help="ann.csv（text,leaf_labels）")
     ap.add_argument("--out", default="dataset.csv", help="輸出的 dataset.csv")
     args = ap.parse_args()
 
@@ -107,12 +107,11 @@ def main():
     try:
         with open(args.ann, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
-            required_cols = {"id", "text", "leaf_labels"}
+            required_cols = {"text", "leaf_labels"}
             if not required_cols.issubset(set(reader.fieldnames or [])):
                 raise ValueError(f"ann.csv 缺少必要欄位，需包含：{required_cols}，目前欄位：{reader.fieldnames}")
 
             for r in reader:
-                rid = normalize_text(r.get("id", ""))
                 text = r.get("text", "")
                 # 全形轉半形 + 基本清洗
                 text = normalize_text(text).replace("\r\n", " ").replace("\n", " ").strip()
@@ -166,7 +165,6 @@ def main():
                 labels_str = ";".join(labels_sorted)
 
                 rows.append({
-                    "id": rid,
                     "text": text,
                     "labels": labels_str
                 })
@@ -177,7 +175,7 @@ def main():
     # 寫出 dataset.csv（UTF-8, 逗號分隔, 雙引號包裹）
     try:
         with open(args.out, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["id","text","labels"], quoting=csv.QUOTE_ALL)
+            writer = csv.DictWriter(f, fieldnames=["text","labels"], quoting=csv.QUOTE_ALL)
             writer.writeheader()
             for r in rows:
                 writer.writerow(r)
@@ -195,3 +193,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -14,9 +14,9 @@ DEFAULT_GRID = {
         # Add any fixed overrides here, e.g.:
     },
     "params": {
-        "weight_align": [0.2, 0.25, 0.3],
-        "num_neg_align": [8, 16, 32],
-        "tau_align": [0.04, 0.07, 0.1],
+        "weight_cl": [0.2, 0.25, 0.3],
+        "num_neg_cl": [8, 16, 32],
+        "tau_cl": [0.04, 0.07, 0.1],
     },
     "workdir_root": None,
     "use_temp_workdir": True,
@@ -56,6 +56,11 @@ def _expand_grid(params):
 def _row_params(row):
     return {k.split("param.", 1)[1]: v for k, v in row.items() if k.startswith("param.")}
 
+def _append_row_txt(path, row):
+    line = " | ".join(f"{k}={v}" for k, v in row.items())
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
 
 def run_grid(grid_cfg, dry_run=False):
     base = dict(grid_cfg.get("base", {}))
@@ -81,6 +86,9 @@ def run_grid(grid_cfg, dry_run=False):
         return []
 
     summary = []
+    txt_path = grid_cfg.get("txt_path") or grid_cfg.get("csv_path") or "grid_search.txt"
+    if os.path.exists(txt_path):
+        open(txt_path, "w", encoding="utf-8").close()
     for idx, combo in enumerate(combos, start=1):
         overrides = dict(base)
         overrides.update(combo)
@@ -109,6 +117,7 @@ def run_grid(grid_cfg, dry_run=False):
             for k, v in res.items():
                 row[f"result.{k}"] = v
         summary.append(row)
+        _append_row_txt(txt_path, row)
 
         if isinstance(res, dict):
             micro = res.get("micro")
