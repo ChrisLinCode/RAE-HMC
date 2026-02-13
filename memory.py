@@ -1,14 +1,19 @@
 # memory.py
-# RAE-HMC M2 (Brute-force only): Retrieval-Augmented Semantic Memory (static)
+# RAE-HMC M2: Retrieval-Augmented Semantic Memory (static)
 # - Keys K = [X; Z], Values V = [rho Y; (1 - rho) I_L]
-# - Retrieval = exact cosine similarities via Q @ K^T + top-k + truncated softmax
-# - No external dependencies. Save/load with dtype-safe JSON.
+# - Retrieval backend: FAISS IndexFlatIP (cosine under normalized embeddings)
+# - Save/load with dtype-safe JSON.
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import Optional
 import os, json
+import numpy as np
 import torch
 import torch.nn.functional as F
+try:
+    import faiss  # type: ignore
+except Exception:
+    faiss = None
 
 Tensor = torch.Tensor
 
@@ -19,21 +24,21 @@ Tensor = torch.Tensor
 class MemoryConfig:
     # Retrieval params
     top_b: int                  # truncated neighborhood size b
-    temperature: float          # τ_r
-    rho: float         # rho in V = [rho Y; (1 - rho) I_L]
+    tau_mem: float              # retrieval temperature
+    rho: float                  # rho in V = [rho Y; (1 - rho) I_L]
 
     # Device & dtype
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: torch.dtype = torch.float32
 
-    # Normalize inputs if upstream didn’t
+    # Normalize inputs if upstream did not already normalize them.
     assume_normalized: bool = True
 
     # Storage
     workdir: str = "./memory_store"
 
-    # Kept only for compatibility with previous scripts (ignored except 'brute')
-    backend: str = "brute"      # must be "brute" in this file
+    # Retrieval backend: "faiss_ip" (legacy names are auto-mapped)
+    backend: str = "faiss_ip"
 
 # ---- dtype <-> str helpers for JSON ----
 def _dtype_to_str(dt):
@@ -52,19 +57,28 @@ def _str_to_dtype(s):
     return torch.float32
 
 # -----------------------------
-# Semantic Memory (brute-force)
+# Semantic Memory
 # -----------------------------
 class SemanticMemory:
     """
-    Implements the RAE-HMC memory (§3.4) with exact cosine retrieval.
-        K = [X; Z]              where X ∈ ℝ^{N×d}, Z ∈ ℝ^{L×d}
-        V = [rho Y; (1 - rho) I_L]     where Y in {0,1}^{N x L}
+    Implements the RAE-HMC memory with FAISS IP retrieval backend.
+        K = [X; Z] where X in R^{N x d}, Z in R^{Lz x d}
+        V = [rho Y; (1 - rho) I_L] where Y in {0,1}^{N x L}
     Provides: build / query / batch_query / save / load
     """
 
     def __init__(self, cfg: MemoryConfig):
-        if cfg.backend != "brute":
-            raise ValueError("This memory.py is brute-force only. Set backend='brute'.")
+        backend = str(getattr(cfg, "backend", "faiss_ip")).lower().strip()
+        if backend in {"brute", "faiss_l2"}:
+            backend = "faiss_ip"
+        if backend != "faiss_ip":
+            raise ValueError("MemoryConfig.backend must be 'faiss_ip'.")
+        if faiss is None:
+            raise ImportError(
+                "FAISS backend requested (backend='faiss_ip') but faiss is not installed. "
+                "Install with: pip install faiss-cpu"
+            )
+        cfg.backend = backend
         self.cfg = cfg
 
         # CPU tensors for persistence; GPU caches for fast math
@@ -72,6 +86,7 @@ class SemanticMemory:
         self.V_cpu: Optional[Tensor] = None  # [N+L, L]
         self.K_gpu: Optional[Tensor] = None
         self.V_gpu: Optional[Tensor] = None
+        self.faiss_index = None
 
         self.N: int = 0
         self.L: int = 0
@@ -80,20 +95,22 @@ class SemanticMemory:
         self._scale: float = 1.0
 
     # ---------- Build ----------
-    def build(self, X: Tensor, Z: Tensor, Y: Tensor, rho: Optional[float] = None) -> None:
+    def build(self, X: Tensor, Z: Tensor, Y: Tensor, rho: Optional[float] = None, Z_label_ids: Optional[Tensor] = None) -> None:
         """
         Args:
             X: [N, d] text embeddings
-            Z: [L, d] label embeddings
+            Z: [Lz, d] label embeddings
             Y: [N, L] multi-hot matrix
+            Z_label_ids: [Lz] label id per Z row (required if Lz != L)
         """
         cfg = self.cfg
         dev = torch.device(cfg.device)
 
         if X.ndim != 2 or Z.ndim != 2: raise ValueError("X,Z must be 2D.")
         if Y.ndim != 2: raise ValueError("Y must be 2D.")
-        N, d1 = X.shape; L, d2 = Z.shape
+        N, d1 = X.shape; Lz, d2 = Z.shape
         if d1 != d2: raise ValueError(f"Embedding dim mismatch: X:{d1} vs Z:{d2}")
+        L = int(Y.shape[1])
         if Y.shape != (N, L): raise ValueError(f"Y must be [N, L]; got {tuple(Y.shape)}")
 
         self.N, self.L, self.d = N, L, d1
@@ -105,13 +122,22 @@ class SemanticMemory:
             Z = F.normalize(Z, p=2, dim=-1)
 
         # CPU tensors for storage
-        K = torch.cat([X, Z], dim=0).to(torch.float32).cpu()            # [N+L, d]
+        K = torch.cat([X, Z], dim=0).to(torch.float32).cpu()            # [N+Lz, d]
         I_L = torch.eye(L, dtype=torch.float32)
         rho_val = max(0.0, min(1.0, rho_val))  # clamp to [0,1]
-        V = torch.cat([rho_val * Y.to(torch.float32), (1.0 - rho_val) * I_L], dim=0).cpu()  # [N+L, L]
+        if Z_label_ids is None:
+            if Lz != L:
+                raise ValueError(f"Z rows ({Lz}) must equal num_labels ({L}) when Z_label_ids is None.")
+            Z_label_ids = torch.arange(L, dtype=torch.long)
+        if Z_label_ids.numel() != Lz:
+            raise ValueError(f"Z_label_ids must have length {Lz}; got {Z_label_ids.numel()}.")
+        V_z = (1.0 - rho_val) * I_L.index_select(0, Z_label_ids.to(I_L.device))
+        V = torch.cat([rho_val * Y.to(torch.float32), V_z], dim=0).cpu()  # [N+Lz, L]
 
         self.K_cpu, self.V_cpu = K, V
         self._refresh_gpu_caches(dev)
+        if self.cfg.backend == "faiss_ip":
+            self._build_faiss_index()
         self._built = True
 
     def _refresh_gpu_caches(self, device: torch.device) -> None:
@@ -119,32 +145,73 @@ class SemanticMemory:
         self.K_gpu = self.K_cpu.to(device=device, dtype=self.cfg.dtype, non_blocking=True)
         self.V_gpu = self.V_cpu.to(device=device, dtype=self.cfg.dtype, non_blocking=True)
 
+    def _build_faiss_index(self) -> None:
+        if self.cfg.backend != "faiss_ip":
+            self.faiss_index = None
+            return
+        if faiss is None:
+            raise ImportError(
+                "FAISS backend requested (backend='faiss_ip') but faiss is not installed. "
+                "Install with: pip install faiss-cpu"
+            )
+        if self.K_cpu is None:
+            raise RuntimeError("Cannot build FAISS index before memory keys are initialized.")
+        K_np = np.ascontiguousarray(self.K_cpu.numpy().astype(np.float32, copy=False))
+        index = faiss.IndexFlatIP(int(self.d))
+        index.add(K_np)
+        self.faiss_index = index
+
     # ---------- Retrieval ----------
-    def query(self, q: Tensor, top_b: Optional[int] = None, temperature: Optional[float] = None) -> Tensor:
+    def query(
+        self,
+        q: Tensor,
+        top_b: Optional[int] = None,
+        tau_mem: Optional[float] = None,
+        temperature: Optional[float] = None,
+    ) -> Tensor:
         if q.ndim != 1 or (self.d and q.shape[0] != self.d):
             raise ValueError(f"q must be [d={self.d}]")
-        return self.batch_query(q.unsqueeze(0), top_b=top_b, temperature=temperature)[0]
+        tau_val = tau_mem if tau_mem is not None else temperature
+        return self.batch_query(q.unsqueeze(0), top_b=top_b, tau_mem=tau_val)[0]
 
-    def batch_query(self, Q: Tensor, top_b: Optional[int] = None, temperature: Optional[float] = None) -> Tensor:
-        if not self._built or self.K_gpu is None or self.V_gpu is None:
+    def batch_query(
+        self,
+        Q: Tensor,
+        top_b: Optional[int] = None,
+        tau_mem: Optional[float] = None,
+        temperature: Optional[float] = None,
+    ) -> Tensor:
+        if not self._built:
             raise RuntimeError("Memory not built. Call build() or load() first.")
         cfg = self.cfg
         dev = torch.device(cfg.device)
         B, d = Q.shape
         if d != self.d:
             raise ValueError(f"Q dim mismatch: got d={d}, expected d={self.d}")
+        if self.K_cpu is None or self.V_cpu is None:
+            raise RuntimeError("Memory tensors are not initialized. Call build() or load() first.")
 
         b = int(cfg.top_b if top_b is None else top_b)
         b = min(b, int(self.K_cpu.shape[0]))     # guard
-        tau = max(1e-6, float(cfg.temperature if temperature is None else temperature))
+        tau_val = tau_mem if tau_mem is not None else temperature
+        tau = max(1e-6, float(cfg.tau_mem if tau_val is None else tau_val))
+        if b <= 0:
+            raise ValueError("top_b must be >= 1.")
 
-        # exact cosine similarities via matrix multiply
-        sims_full = (Q.to(dev) @ self.K_gpu.T)   # [B, N+L]
-        sims, nn_idx = torch.topk(sims_full, k=b, dim=1, largest=True, sorted=False)  # [B,b]
+        if self.faiss_index is None:
+            self._build_faiss_index()
+        Q_np = np.ascontiguousarray(Q.detach().to(torch.float32).cpu().numpy())
+        sim_np, nn_idx_np = self.faiss_index.search(Q_np, b)
+        sims = torch.from_numpy(sim_np).to(device=dev, dtype=self.cfg.dtype)
+        nn_idx = torch.from_numpy(nn_idx_np.astype(np.int64, copy=False)).to(device=dev, dtype=torch.long)
 
         logits = sims / tau
         alpha = torch.softmax(logits, dim=-1)    # [B,b]
 
+        if self.V_gpu is None:
+            self._refresh_gpu_caches(dev)
+        if self.V_gpu is None:
+            raise RuntimeError("GPU value cache is not initialized. Call build() or load() first.")
         V_neighbors = self.V_gpu.index_select(0, nn_idx.view(-1)).view(B, b, self.L)
         S_mem = torch.bmm(alpha.unsqueeze(1), V_neighbors).squeeze(1)  # [B,L]
         scale = max(self._scale, 1e-6)
@@ -174,9 +241,15 @@ class SemanticMemory:
         cfg_dict = meta.get("cfg", {})
         if "rho" not in cfg_dict and "lambda_label" in cfg_dict:
             cfg_dict["rho"] = cfg_dict.pop("lambda_label")
+        if "tau_mem" not in cfg_dict and "temperature" in cfg_dict:
+            cfg_dict["tau_mem"] = cfg_dict.pop("temperature")
+        elif "temperature" in cfg_dict:
+            cfg_dict.pop("temperature", None)
         cfg_dict["dtype"] = _str_to_dtype(cfg_dict.get("dtype", "float32"))
-        # force brute to avoid mismatches
-        cfg_dict["backend"] = "brute"
+        backend = str(cfg_dict.get("backend", "faiss_ip")).lower().strip()
+        if backend in {"brute", "faiss_l2"}:
+            backend = "faiss_ip"
+        cfg_dict["backend"] = backend
         cfg = MemoryConfig(**cfg_dict)
 
         mem = cls(cfg)
@@ -184,10 +257,12 @@ class SemanticMemory:
         mem.V_cpu = torch.load(os.path.join(dirname, "V.pt"), map_location="cpu")
         mem.N = int(meta["N"]); mem.L = int(meta["L"]); mem.d = int(meta["d"])
         mem._refresh_gpu_caches(torch.device(cfg.device))
+        if cfg.backend == "faiss_ip":
+            mem._build_faiss_index()
         mem._built = True
         return mem
 
-    # kept for API compatibility; no-op in brute mode
+    # kept for API compatibility; no-op in current backends
     def set_ef_search(self, ef: int) -> None:
         return
 
@@ -196,7 +271,7 @@ class SemanticMemory:
 # -----------------------------
 if __name__ == "__main__":
     torch.manual_seed(0)
-    cfg = MemoryConfig(top_b=5, temperature=0.07, rho=1.0, assume_normalized=True, backend="brute")
+    cfg = MemoryConfig(top_b=5, tau_mem=0.07, rho=1.0, assume_normalized=True, backend="faiss_ip")
     N, L, d = 6, 4, 8
     X = F.normalize(torch.randn(N, d), p=2, dim=-1)
     Z = F.normalize(torch.randn(L, d), p=2, dim=-1)
@@ -210,4 +285,5 @@ if __name__ == "__main__":
     mem.save("./memory_store")
     mem2 = SemanticMemory.load("./memory_store")
     S2 = mem2.batch_query(Q)
-    print("Reload Δ:", float((S - S2).abs().max()))
+    print("Reload ?:", float((S - S2).abs().max()))
+

@@ -11,12 +11,12 @@ from train_rae_hmc import TrainConfig, main
 
 DEFAULT_GRID = {
     "base": {
-        # Add any fixed overrides here, e.g.:
+        # Add any fixed overrides here.
     },
     "params": {
-        "weight_cl": [0.2, 0.25, 0.3],
-        "num_neg_cl": [8, 16, 32],
-        "tau_cl": [0.04, 0.07, 0.1],
+        "classifier_lr_global": [5e-3, 1e-2],
+        "classifier_lr_local": [5e-5, 1e-4],
+        "classifier_lr_fusion": [1e-3, 3e-3, 5e-3],
     },
     "workdir_root": None,
     "use_temp_workdir": True,
@@ -31,7 +31,10 @@ def _ensure_list(value):
 
 def _format_value(value):
     if isinstance(value, float):
-        text = f"{value:.6g}"
+        if value != 0.0 and (abs(value) < 1e-3 or abs(value) >= 1e4):
+            text = f"{value:.0e}"
+        else:
+            text = f"{value:.6g}"
     else:
         text = str(value)
     return (
@@ -56,8 +59,28 @@ def _expand_grid(params):
 def _row_params(row):
     return {k.split("param.", 1)[1]: v for k, v in row.items() if k.startswith("param.")}
 
-def _append_row_txt(path, row):
-    line = " | ".join(f"{k}={v}" for k, v in row.items())
+def _format_param_items(params):
+    items = []
+    for k, v in params.items():
+        items.append(f"{k}={_format_value(v)}")
+    return ", ".join(items)
+
+
+def _append_row_txt(path, params, micro, macro, dynamic):
+    micro_str = "None" if micro is None else f"{micro:.4f}"
+    macro_str = "None" if macro is None else f"{macro:.4f}"
+    dyn_parts = []
+    for k in ("eta", "delta", "rho", "top_b"):
+        v = dynamic.get(k, None)
+        if v is None:
+            dyn_parts.append(f"{k}=None")
+        else:
+            dyn_parts.append(f"{k}={_format_value(v)}")
+    line = (
+        f"params: {_format_param_items(params)} | "
+        f"micro={micro_str} | macro={macro_str} | "
+        + " | ".join(dyn_parts)
+    )
     with open(path, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
@@ -86,15 +109,16 @@ def run_grid(grid_cfg, dry_run=False):
         return []
 
     summary = []
-    txt_path = grid_cfg.get("txt_path") or grid_cfg.get("csv_path") or "grid_search.txt"
-    if os.path.exists(txt_path):
-        open(txt_path, "w", encoding="utf-8").close()
+    txt_path = grid_cfg.get("txt_path") or grid_cfg.get("csv_path") or os.path.join("outputs", "grid_search.txt")
+    os.makedirs(os.path.dirname(txt_path) or ".", exist_ok=True)
+    header = "params | micro | macro | eta | delta | rho | top_b"
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(header + "\n")
     for idx, combo in enumerate(combos, start=1):
         overrides = dict(base)
         overrides.update(combo)
         if force_no_ablation:
             overrides["run_ablation"] = False
-            overrides["run_cl_ablation"] = False
 
         if "workdir" not in overrides:
             if workdir_root:
@@ -117,7 +141,10 @@ def run_grid(grid_cfg, dry_run=False):
             for k, v in res.items():
                 row[f"result.{k}"] = v
         summary.append(row)
-        _append_row_txt(txt_path, row)
+        micro_val = res.get("micro") if isinstance(res, dict) else None
+        macro_val = res.get("macro_all") if isinstance(res, dict) else None
+        dynamic = res if isinstance(res, dict) else {}
+        _append_row_txt(txt_path, combo, micro_val, macro_val, dynamic)
 
         if isinstance(res, dict):
             micro = res.get("micro")
