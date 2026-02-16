@@ -260,18 +260,6 @@ def build_multi_hot_Y(
             Y[i][j] = 1
     return Y
 
-def level_order_indices(levels: Dict[int, int]) -> List[int]:
-    """
-    Return label ids sorted by (level asc, then name asc). Useful to match [L1, L2, ...] concatenation.
-    """
-    return sorted(levels.keys(), key=lambda nid: (levels[nid], nid))
-
-def reorder_edges_by_level(edges: List[Tuple[int, int]], levels: Dict[int, int]) -> List[Tuple[int, int]]:
-    """
-    Order edges from upper to deeper levels (parents first). Not required, but convenient for logging.
-    """
-    return sorted(edges, key=lambda pc: (levels.get(pc[0], 10**9), levels.get(pc[1], 10**9), pc[0], pc[1]))
-
 def make_level_slices(levels: Dict[int, int]) -> List[List[int]]:
     """
     Return a list of lists: ids per level (1-based), useful to init M3 local heads.
@@ -284,9 +272,6 @@ def make_level_slices(levels: Dict[int, int]) -> List[List[int]]:
     for l in range(max_lvl):
         per_level[l].sort()
     return per_level
-
-def path_string_for_ids(path: List[int], id2label: Dict[int, str], sep: str = " > ") -> str:
-    return sep.join(id2label[i] for i in path)
 
 # -----------------------------
 # Minimal smoke test

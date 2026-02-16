@@ -38,31 +38,42 @@ class TrainConfig:
     # Encoder
     model_name: str = "bert-base-chinese"
     max_len: int = 32
+    # Label text depth for memory label embeddings:
+    # 0=self only, 1=parent>self, 2=grandparent>parent>self, ...
+    label_path_depth: int = 1
     batch_size: int = 16 #HMCN論文配置
     cache_tokens_on_gpu: bool = True  # cache fold tokens on GPU to reduce CPU->GPU transfer (needs VRAM)
     encoder_pooling: str = "mean"  # "cls" | "mean"
+
     # Training hyperparameters
-    classifier_epochs: int = 12           # stage 2: classifier training epochs
-    
-    contrast_lr: float = 5e-5             # encoder lr during stage 2
-    classifier_lr: float = 3e-3          # classifier head lr for stage 2
+    classifier_epochs: int = 12
+    contrast_lr: float = 5e-5   
+    classifier_lr: float = 3e-3
     classifier_lr_global: Optional[float] = 1e-2 
-    classifier_lr_local: Optional[float] = 1e-4
+    classifier_lr_local: Optional[float] = 3e-4 
     classifier_lr_fusion: Optional[float] = 5e-3
+    
     seed: int = 42
     warmup_ratio: float = 0.15 #0.15
 
-    # cl loss
+    # contrastive losses (shared master switch)
     use_cl_loss: bool = True
-    inbatch_tau: float = 0.1
-    inbatch_loss_cl_weight: float = 0.0001
+    sample_cl_tau: float = 0.1
+    sample_cl_weight: float = 0.0001
+
+    # label-side HNM contrastive loss
+    hnm_cl_tau: float = 0.1
+    hnm_cl_weight: float = 0.01
+    hnm_cl_pos_topm: int = 5
+    hnm_cl_neg_topk: int = 10
+    hnm_cl_refresh_every_epochs: int = 1
     
     # Memory (M2)
-    top_b: int = 45
-    top_b_candidates: List[int] = field(default_factory=lambda: [15, 30, 45, 60, 75, 90])
     tau_mem: float = 0.07 # memory retrieval temperature
     rho: float = 0.5
-    rho_candidates: List[float] = field(default_factory=lambda: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+    rho_candidates: List[float] = field(default_factory=lambda: [0.1, 0.3, 0.5, 0.7, 0.9])
+    top_b: int = 45
+    top_b_candidates: List[int] = field(default_factory=lambda: [15, 30, 45, 60, 75, 90])
     memory_build_mode: str = "prototype"  # "sample" | "prototype"
     memory_proto_k: int = 1
     memory_proto_max_iters: int = 10
@@ -92,15 +103,12 @@ class TrainConfig:
     weight_path: float = 1.0 #0.0
 
     # Fusion (M4)
-    eta: float = 0.5
-    delta: float = 0.25
-    delta_mode: str = "global"  # "global" | "level" (per-level thresholds)
     topk: Optional[int] = 15
-    #eta_candidates: List[float] = field(default_factory=lambda: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
-    eta_candidates: List[float] = None
+    eta: float = 0.5
+    delta: float = 0.3
+    delta_mode: str = "global"  # "global" | "level" (per-level thresholds)    
+    eta_candidates: List[float] = field(default_factory=lambda: [0.1, 0.3, 0.5, 0.7, 0.9])
     delta_candidates: List[float] = field(default_factory=lambda: [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5])
-    val_metric: str = "macro"  # metric for selecting best validation parameters ("micro" or "macro")
-    auto_tune_params: bool = True  # If True, tune rho/eta/delta/top_b on validation
 
     # Sampling (tail-aware / level-aware)
     # Four-bin tail weighting by fixed label frequency quartiles (0-25/25-50/50-75/75-100)
@@ -112,6 +120,8 @@ class TrainConfig:
     level_weight_scale: float = 0.05  # per-sample max label depth * scale
 
     weighted_extra_ratio: float = 1.0
+    val_metric: str = "macro"  # metric for selecting best validation parameters ("micro" or "macro")
+    auto_tune_params: bool = True  # If True, tune rho/eta/delta/top_b on validation
 
     # Module switches / ablations
     use_memory: bool = True
@@ -141,6 +151,30 @@ def strip_root_label(labels: List[str], root_name: str) -> List[str]:
     if not root_name:
         return labels
     return [l for l in labels if l != root_name]
+
+def build_label_descriptions(hd, path_depth: int) -> List[str]:
+    """
+    Build label text descriptions with controllable ancestor depth.
+    depth=0 -> self
+    depth=1 -> parent > self
+    depth=2 -> grandparent > parent > self
+    For multi-parent DAGs, follow the first parent (same convention as path_strings).
+    """
+    depth = max(0, int(path_depth))
+    label_descs: List[str] = []
+    for label_id in range(hd.num_labels):
+        chain = [int(label_id)]
+        cur = int(label_id)
+        for _ in range(depth):
+            parents = hd.parents.get(cur, [])
+            if not parents:
+                break
+            cur = int(parents[0])
+            chain.append(cur)
+        chain.reverse()
+        parts = [hd.id2label.get(i, str(i)) for i in chain]
+        label_descs.append(" > ".join(parts))
+    return label_descs
 
 def init_ablation_result_txt(path: str) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -640,15 +674,230 @@ def select_tokens_by_index(tokens: Dict[str, torch.Tensor], indices: List[int], 
     idx_tensor = torch.tensor(indices, dtype=torch.long, device=token_device)
     return {k: v.index_select(0, idx_tensor).to(device) for k, v in tokens.items()}
 
-def configure_cl_for_stage2(comb: JointLossCombiner, cfg: TrainConfig) -> bool:
+def configure_cl_for_stage2(
+    comb: JointLossCombiner,
+    cfg: TrainConfig,
+    classifier_on: bool = True,
+) -> bool:
     stage2_cl_on = bool(cfg.use_cl_loss)
-    comb.loss.use_bce_loss = True
     comb.loss.use_cl_loss = stage2_cl_on
-    inbatch_w = float(getattr(cfg, "inbatch_loss_cl_weight", 0.0))
-    comb.loss.weight_cl = inbatch_w if stage2_cl_on else 0.0
-    comb.loss.use_path_loss = cfg.use_path_loss
-    comb.loss.weight_path = cfg.weight_path if cfg.use_path_loss else 0.0
+    comb.loss.use_bce_loss = bool(classifier_on)
+    sample_cl_w = float(getattr(cfg, "sample_cl_weight", 0.0))
+    comb.loss.weight_cl = sample_cl_w if stage2_cl_on else 0.0
+    if classifier_on:
+        comb.loss.use_path_loss = cfg.use_path_loss
+        comb.loss.weight_path = cfg.weight_path if cfg.use_path_loss else 0.0
+    else:
+        comb.loss.use_path_loss = False
+        comb.loss.weight_path = 0.0
     return stage2_cl_on
+
+@dataclass
+class LabelLossState:
+    enabled: bool
+    label_tokens: Dict[str, torch.Tensor]
+    terminal_pos_by_sample: List[List[int]]
+    exclude_by_sample: List[List[int]]
+    tau: float
+    topm: int
+    topk: int
+    weight: float
+    label_cache: Optional[torch.Tensor] = None
+
+def build_descendant_index_map(children: Dict[int, List[int]], num_labels: int) -> Dict[int, List[int]]:
+    descendants: Dict[int, List[int]] = {}
+    for nid in range(num_labels):
+        seen = set()
+        stack = list(children.get(nid, []))
+        while stack:
+            cur = int(stack.pop())
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(children.get(cur, []))
+        descendants[nid] = sorted(seen)
+    return descendants
+
+def build_terminal_and_exclude_indices(
+    Y: torch.Tensor,
+    ancestors: Dict[int, List[int]],
+    descendants: Dict[int, List[int]],
+) -> Tuple[List[List[int]], List[List[int]]]:
+    Y_cpu = (Y.detach().cpu() > 0.5)
+    N, L = Y_cpu.shape
+    terminal_by_sample: List[List[int]] = []
+    exclude_by_sample: List[List[int]] = []
+
+    for i in range(N):
+        pos = torch.nonzero(Y_cpu[i], as_tuple=False).view(-1).tolist()
+        pos_set = set(int(p) for p in pos)
+        terminals: List[int] = []
+        for p in pos:
+            p_int = int(p)
+            desc = descendants.get(p_int, [])
+            has_pos_desc = any(int(d) in pos_set for d in desc)
+            if not has_pos_desc:
+                terminals.append(p_int)
+        if not terminals:
+            terminals = [int(p) for p in pos]
+
+        exclude = set()
+        for t in terminals:
+            exclude.add(int(t))
+            exclude.update(int(a) for a in ancestors.get(int(t), []))
+            exclude.update(int(d) for d in descendants.get(int(t), []))
+
+        terminals = sorted([t for t in terminals if 0 <= int(t) < L])
+        exclude_sorted = sorted([e for e in exclude if 0 <= int(e) < L])
+        terminal_by_sample.append(terminals)
+        exclude_by_sample.append(exclude_sorted)
+    return terminal_by_sample, exclude_by_sample
+
+def compute_label_infonce_loss(
+    *,
+    enc: SharedEncoder,
+    h_x: torch.Tensor,
+    batch_indices: List[int],
+    label_state: LabelLossState,
+    device: torch.device,
+) -> torch.Tensor:
+    if not label_state.enabled or label_state.label_cache is None:
+        return h_x.sum() * 0.0
+
+    B = h_x.size(0)
+    if B == 0:
+        return h_x.sum() * 0.0
+
+    tau = max(1e-8, float(label_state.tau))
+    topm = max(1, int(label_state.topm))
+    topk = max(1, int(label_state.topk))
+
+    x_norm = F.normalize(h_x, p=2, dim=-1)
+    z_cache = label_state.label_cache
+    if z_cache.device != device:
+        z_cache = z_cache.to(device)
+    z_cache_norm = F.normalize(z_cache, p=2, dim=-1)
+    sim_cache = x_norm @ z_cache_norm.T  # [B, L]
+
+    chosen: List[Tuple[int, int, List[int]]] = []
+    unique_label_ids = set()
+
+    for row, sample_idx in enumerate(batch_indices):
+        if sample_idx < 0 or sample_idx >= len(label_state.terminal_pos_by_sample):
+            continue
+        pos_pool = label_state.terminal_pos_by_sample[sample_idx]
+        if not pos_pool:
+            continue
+
+        pos_tensor = torch.tensor(pos_pool, dtype=torch.long, device=device)
+        pos_sims = sim_cache[row].index_select(0, pos_tensor)
+        m = min(topm, int(pos_sims.numel()))
+        if m <= 0:
+            continue
+        hardest_m = torch.topk(pos_sims, k=m, largest=False).indices
+        pick = int(torch.randint(0, m, (1,), device=device).item())
+        pos_idx_in_pool = int(hardest_m[pick].item())
+        pos_label_id = int(pos_pool[pos_idx_in_pool])
+
+        row_scores = sim_cache[row].clone()
+        exclude = label_state.exclude_by_sample[sample_idx] if sample_idx < len(label_state.exclude_by_sample) else []
+        if exclude:
+            ex_tensor = torch.tensor(exclude, dtype=torch.long, device=device)
+            row_scores.index_fill_(0, ex_tensor, float("-inf"))
+
+        finite_count = int(torch.isfinite(row_scores).sum().item())
+        if finite_count <= 0:
+            continue
+        k = min(topk, finite_count)
+        neg_label_ids = torch.topk(row_scores, k=k, largest=True).indices.tolist()
+        neg_label_ids = [int(v) for v in neg_label_ids]
+        if not neg_label_ids:
+            continue
+
+        chosen.append((row, pos_label_id, neg_label_ids))
+        unique_label_ids.add(pos_label_id)
+        unique_label_ids.update(neg_label_ids)
+
+    if not chosen:
+        return h_x.sum() * 0.0
+
+    unique_ids = sorted(list(unique_label_ids))
+    label_batch_tokens = select_tokens_by_index(label_state.label_tokens, unique_ids, device)
+    label_kwargs = {
+        "input_ids": label_batch_tokens["input_ids"],
+        "attention_mask": label_batch_tokens["attention_mask"],
+    }
+    if "token_type_ids" in label_batch_tokens:
+        label_kwargs["token_type_ids"] = label_batch_tokens["token_type_ids"]
+    z_online = enc.forward(**label_kwargs)
+    z_online = F.normalize(z_online, p=2, dim=-1)
+
+    id_to_col = {int(lid): col for col, lid in enumerate(unique_ids)}
+    loss_terms: List[torch.Tensor] = []
+    for row, pos_label_id, neg_label_ids in chosen:
+        pos_col = id_to_col.get(pos_label_id, None)
+        if pos_col is None:
+            continue
+        pos_logit = torch.dot(x_norm[row], z_online[pos_col]) / tau
+        neg_cols = [id_to_col[nid] for nid in neg_label_ids if nid in id_to_col]
+        if not neg_cols:
+            continue
+        neg_tensor = z_online.index_select(0, torch.tensor(neg_cols, dtype=torch.long, device=device))
+        neg_logits = neg_tensor @ x_norm[row] / tau
+        logits = torch.cat([pos_logit.view(1), neg_logits], dim=0)
+        loss_i = -(pos_logit - torch.logsumexp(logits, dim=0))
+        loss_terms.append(loss_i)
+
+    if not loss_terms:
+        return h_x.sum() * 0.0
+    return torch.stack(loss_terms).mean()
+
+def init_label_loss_state(
+    cfg: TrainConfig,
+    hd,
+    Y_train_subset: torch.Tensor,
+    label_tokens: Dict[str, torch.Tensor],
+) -> Optional[LabelLossState]:
+    # Keep sample CL and HNM-CL under one master switch.
+    if not bool(getattr(cfg, "use_cl_loss", False)):
+        return None
+    weight = float(getattr(cfg, "hnm_cl_weight", 0.0))
+    if weight <= 0.0:
+        return None
+
+    num_labels = int(Y_train_subset.size(1))
+    descendants = build_descendant_index_map(getattr(hd, "children", {}), num_labels)
+    terminal_pos, exclude = build_terminal_and_exclude_indices(
+        Y_train_subset,
+        getattr(hd, "ancestors", {}),
+        descendants,
+    )
+    return LabelLossState(
+        enabled=True,
+        label_tokens=label_tokens,
+        terminal_pos_by_sample=terminal_pos,
+        exclude_by_sample=exclude,
+        tau=float(getattr(cfg, "hnm_cl_tau", 0.1)),
+        topm=int(getattr(cfg, "hnm_cl_pos_topm", 5)),
+        topk=int(getattr(cfg, "hnm_cl_neg_topk", 16)),
+        weight=weight,
+        label_cache=None,
+    )
+
+def maybe_refresh_label_cache(
+    label_state: Optional[LabelLossState],
+    enc: SharedEncoder,
+    cfg: TrainConfig,
+    device: torch.device,
+    epoch: int,
+) -> None:
+    if label_state is None or not label_state.enabled:
+        return
+    refresh_every = max(1, int(getattr(cfg, "hnm_cl_refresh_every_epochs", 2)))
+    if label_state.label_cache is not None and ((epoch - 1) % refresh_every) != 0:
+        return
+    z_cache = encode_with_encoder(enc, label_state.label_tokens, cfg.batch_size, device)
+    label_state.label_cache = F.normalize(z_cache.to(device), p=2, dim=-1).detach()
 
 def run_training_indices_common(
     *,
@@ -666,6 +915,7 @@ def run_training_indices_common(
     opt,
     scheduler,
     running: Dict[str, float],
+    label_state: Optional[LabelLossState] = None,
 ) -> None:
     need_cls = (clf is not None) and (
         getattr(comb.loss, "use_bce_loss", True)
@@ -707,7 +957,18 @@ def run_training_indices_common(
             h_x=h_x,
             edges_parent_child=edges_pc,
         )
-        loss = losses["loss_total"]
+        loss_label = h_x.sum() * 0.0
+        if label_state is not None and label_state.enabled:
+            loss_label = compute_label_infonce_loss(
+                enc=enc,
+                h_x=h_x,
+                batch_indices=batch_idx,
+                label_state=label_state,
+                device=device,
+            )
+        loss = losses["loss_total"] + (
+            float(label_state.weight) * loss_label if (label_state is not None and label_state.enabled) else 0.0
+        )
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
@@ -716,8 +977,9 @@ def run_training_indices_common(
 
         bs = len(batch_idx)
         running["bce"] += float(losses["loss_bce"]) * bs
-        running["cl"] += float(losses["loss_cl"]) * bs
+        running["sample_cl_loss"] += float(losses["loss_cl"]) * bs
         running["path"] += float(losses["loss_path"]) * bs
+        running["hnm_cl_loss"] += float(loss_label.detach()) * bs
         running["total"] += float(loss) * bs
 
 def build_tail_level_masks(
@@ -972,6 +1234,45 @@ def tune_fusion_parameters(
                         best_top_b = int(top_b)
     return best_eta, best_delta, best_delta_levels, best_score, best_micro, best_macro, best_top_b
 
+def tune_memory_only_parameters(
+    enc: SharedEncoder,
+    mem: SemanticMemory,
+    tokens: Dict[str, torch.Tensor],
+    Y_val: torch.Tensor,
+    cfg: TrainConfig,
+    device: torch.device,
+    label_levels: Optional[List[int]] = None,
+) -> Tuple[float, Optional[Dict[int, float]], float, float, float, int]:
+    X_va_enc = encode_with_encoder(enc, tokens, cfg.batch_size, device)
+    X_va_dev = X_va_enc.to(device)
+
+    best_delta = float(cfg.delta)
+    best_delta_levels: Optional[Dict[int, float]] = None
+    best_score = -1.0
+    best_micro = -1.0
+    best_macro = -1.0
+    best_top_b = int(cfg.top_b)
+
+    top_b_candidates = get_top_b_candidates(cfg)
+    with torch.no_grad():
+        for top_b in top_b_candidates:
+            s_mem_va = mem.batch_query(X_va_dev, top_b=top_b)
+            delta_val, delta_levels, score, micro, macro = tune_memory_only_delta(
+                s_mem_va,
+                Y_val,
+                cfg,
+                label_levels=label_levels,
+                topk=None,
+            )
+            if score > best_score:
+                best_delta = float(delta_val)
+                best_delta_levels = delta_levels
+                best_score = score
+                best_micro = micro
+                best_macro = macro
+                best_top_b = int(top_b)
+    return best_delta, best_delta_levels, best_score, best_micro, best_macro, best_top_b
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -1097,17 +1398,7 @@ def main(cfg: TrainConfig, summary: Optional[List[Dict[str, float]]] = None, sce
     print("[Stage] Initializing shared encoder...")
     enc = SharedEncoder(EncoderConfig(model_name=cfg.model_name, max_length=cfg.max_len, pooling=cfg.encoder_pooling, normalize=True, device=device_str))
     print("[Stage] Tokenizing train/test/label texts...")
-    # Use parent + self (for multi-parent, follow the first parent like path_strings).
-    label_descs = []
-    for i in range(hd.num_labels):
-        self_name = hd.id2label.get(i, str(i))
-        parents = hd.parents.get(i, [])
-        if parents:
-            parent_id = parents[0]
-            parent_name = hd.id2label.get(parent_id, str(parent_id))
-            label_descs.append(f"{parent_name} > {self_name}")
-        else:
-            label_descs.append(self_name)
+    label_descs = build_label_descriptions(hd, getattr(cfg, "label_path_depth", 1))
     train_tokens = tokenize_texts(enc.tokenizer, tr_texts, cfg.max_len)
     test_tokens = tokenize_texts(enc.tokenizer, te_texts, cfg.max_len)
     label_tokens = tokenize_texts(enc.tokenizer, label_descs, cfg.max_len)
@@ -1393,7 +1684,7 @@ def train_single_fold(
             focal_gamma=cfg.focal_gamma,
             use_bce_loss=True,
             path_on_local=False,
-            inbatch_tau=cfg.inbatch_tau,
+            inbatch_tau=cfg.sample_cl_tau,
             weight_cl=1.0,
             use_cl_loss=cfg.use_cl_loss,
             use_path_loss=cfg.use_path_loss,
@@ -1414,6 +1705,7 @@ def train_single_fold(
         val_tokens = move_tokens_to_device(val_tokens, device)
     Y_tr = Y_train_full.index_select(0, torch.tensor(train_indices, dtype=torch.long))
     Y_va = Y_train_full.index_select(0, torch.tensor(val_indices, dtype=torch.long))
+    label_state = init_label_loss_state(cfg, hd, Y_tr, label_tokens)
     Y_tr_dev = Y_tr.to(device)
 
     tail_mask_q0_25, tail_mask_q25_50, tail_mask_q50_75, tail_mask_q75_100 = build_tail_level_masks(Y_tr)
@@ -1448,25 +1740,8 @@ def train_single_fold(
     last_tuned_top_b = cfg.top_b
     auto_tune_params = bool(getattr(cfg, "auto_tune_params", True))
 
-    # ---------------- Stage 2: Classifier training ----------------
-    if not cls_on:
-        return {
-            "fold": fold_name,
-            "best_val_score": best_score,
-            "best_val_micro": best_val_micro,
-            "best_val_macro": best_val_macro,
-            "best_path": best_path if os.path.exists(best_path) else None,
-            "train_indices": train_indices,
-            "val_indices": val_indices,
-            "last_tuned_eta": last_tuned_eta,
-            "last_tuned_delta": last_tuned_delta,
-            "last_tuned_delta_levels": last_tuned_delta_levels,
-            "last_tuned_rho": last_tuned_rho,
-            "last_tuned_top_b": last_tuned_top_b,
-            "use_memory": bool(cfg.use_memory),
-        }
-
-    configure_cl_for_stage2(comb, cfg)
+    # ---------------- Stage 2: Classifier / CL-only training ----------------
+    configure_cl_for_stage2(comb, cfg, classifier_on=cls_on)
 
     cls_only_delta = 0.5
     def eval_classifier_only(ep_label: str) -> Tuple[float, float]:
@@ -1487,11 +1762,20 @@ def train_single_fold(
               f"(delta={cls_only_delta:.2f})")
         return micro, macro_all
 
-    param_groups = [
-        {"params": enc.parameters(), "lr": cfg.contrast_lr},  # encoder finetune lr
-        *build_classifier_param_groups(clf, cfg),
-    ]
-    trainable_params_cls = list(enc.parameters()) + list(clf.parameters())
+    if cls_on:
+        assert clf is not None
+        param_groups = [
+            {"params": enc.parameters(), "lr": cfg.contrast_lr},  # encoder finetune lr
+            *build_classifier_param_groups(clf, cfg),
+        ]
+        trainable_params_cls = list(enc.parameters()) + list(clf.parameters())
+        train_log_tag = "Cls"
+    else:
+        param_groups = [
+            {"params": enc.parameters(), "lr": cfg.contrast_lr},
+        ]
+        trainable_params_cls = list(enc.parameters())
+        train_log_tag = "MemOnly-CL"
     total_steps_cls = max(1, steps_per_epoch_stage2 * cfg.classifier_epochs)
     warmup_steps_cls = int(cfg.warmup_ratio * total_steps_cls)
     opt = torch.optim.AdamW(param_groups, lr=cfg.classifier_lr)
@@ -1504,10 +1788,11 @@ def train_single_fold(
     last_cls_eval_ep = 0
     final_epoch = 0
     for ep in range(1, cfg.classifier_epochs + 1):
+        maybe_refresh_label_cache(label_state, enc, cfg, device, ep)
         enc.train()
         if clf is not None:
             clf.train()
-        running = {"bce": 0.0, "cl": 0.0, "path": 0.0, "total": 0.0}
+        running = {"bce": 0.0, "sample_cl_loss": 0.0, "hnm_cl_loss": 0.0, "path": 0.0, "total": 0.0}
 
         base_indices = torch.randperm(Ntr).tolist()
         run_training_indices_common(
@@ -1525,6 +1810,7 @@ def train_single_fold(
             opt=opt,
             scheduler=scheduler,
             running=running,
+            label_state=label_state,
         )
 
         if extra_sample_count_stage2 > 0:
@@ -1544,12 +1830,14 @@ def train_single_fold(
                 opt=opt,
                 scheduler=scheduler,
                 running=running,
+                label_state=label_state,
             )
 
-        print(f"[{fold_name} | Cls Ep {ep}] train total={running['total']/Ntr:.4f} | "
-              f"bce={running['bce']/Ntr:.4f} cl={running['cl']/Ntr:.4f} path={running['path']/Ntr:.4f}")
+        print(f"[{fold_name} | {train_log_tag} Ep {ep}] train total={running['total']/Ntr:.4f} | "
+              f"bce={running['bce']/Ntr:.4f} sample_cl_loss={running['sample_cl_loss']/Ntr:.4f} "
+              f"hnm_cl_loss={running['hnm_cl_loss']/Ntr:.4f} path={running['path']/Ntr:.4f}")
 
-        if ep % 4 == 0:
+        if cls_on and ep % 4 == 0:
             eval_classifier_only(str(ep))
             last_cls_eval_ep = ep
         final_epoch = ep
@@ -1561,7 +1849,7 @@ def train_single_fold(
             print(f"[{fold_name}] Early stopping triggered after {patience} stale epochs.")
             break
 
-    if final_epoch > 0 and last_cls_eval_ep != final_epoch:
+    if cls_on and final_epoch > 0 and last_cls_eval_ep != final_epoch:
         eval_classifier_only(str(final_epoch))
 
     # After classifier training, tune memory fusion once on val set
@@ -1569,6 +1857,7 @@ def train_single_fold(
     if clf is not None:
         clf.eval()
 
+    fusion_on = cfg.use_memory and cls_on
     mem = None
     tuned_eta = cfg.eta
     tuned_delta = cfg.delta
@@ -1580,7 +1869,6 @@ def train_single_fold(
         Z_eval = encode_with_encoder(enc, label_tokens, cfg.batch_size, device)
         X_tr_mem = encode_with_encoder(enc, train_tokens, cfg.batch_size, device)
         X_mem_base, Y_mem_base = prepare_memory_inputs(X_tr_mem, Y_tr, cfg, hd)
-        fusion_on = cfg.use_memory and (cfg.use_global_branch or cfg.use_local_branch)
         if auto_tune_params:
             rho_candidates = getattr(cfg, "rho_candidates", None) or [cfg.rho]
             rho_candidates = list(rho_candidates)
@@ -1605,8 +1893,9 @@ def train_single_fold(
                         label_tokens=label_tokens, label_levels=label_levels
                     )
                 else:
-                    eta_val, delta_val, delta_levels, score, micro, macro, top_b_val = (
-                        tuned_eta, tuned_delta, None, -1.0, -1.0, -1.0, cfg.top_b
+                    eta_val = float(cfg.eta)
+                    delta_val, delta_levels, score, micro, macro, top_b_val = tune_memory_only_parameters(
+                        enc, mem_tmp, val_tokens, Y_va, cfg, device, label_levels=label_levels
                     )
 
                 if best_mem is None or score > best_score:
@@ -1634,13 +1923,14 @@ def train_single_fold(
             tuned_top_b = int(cfg.top_b)
             tuned_delta_levels = None
 
-    fusion_on = cfg.use_memory and (cfg.use_global_branch or cfg.use_local_branch)
-    if fusion_on and mem is not None:
-        last_tuned_eta = tuned_eta
-        last_tuned_delta = tuned_delta
-        last_tuned_delta_levels = tuned_delta_levels
+    if cfg.use_memory and mem is not None:
         last_tuned_rho = tuned_rho
         last_tuned_top_b = tuned_top_b
+        last_tuned_delta = tuned_delta
+        last_tuned_delta_levels = tuned_delta_levels
+
+    if fusion_on and mem is not None:
+        last_tuned_eta = tuned_eta
         engine.cfg.eta = tuned_eta
         engine.cfg.delta = tuned_delta
 
@@ -1678,13 +1968,17 @@ def train_single_fold(
     best_score = macro_all if val_metric == "macro" else micro
     best_val_micro = micro
     best_val_macro = macro_all
-    fusion_info = (f"(rho={tuned_rho:.2f}, eta={tuned_eta:.2f}, delta={tuned_delta:.2f}, top_b={tuned_top_b})"
-                   if (fusion_on and mem is not None) else "(fusion off)")
+    if fusion_on and mem is not None:
+        fusion_info = f"(rho={tuned_rho:.2f}, eta={tuned_eta:.2f}, delta={tuned_delta:.2f}, top_b={tuned_top_b})"
+    elif cfg.use_memory and mem is not None:
+        fusion_info = f"(memory_only rho={tuned_rho:.2f}, delta={tuned_delta:.2f}, top_b={tuned_top_b})"
+    else:
+        fusion_info = "(memory off)"
     print(f"[{fold_name}] VAL (post-train tuning) micro-F1={micro:.4f}  macro-F1={macro_all:.4f}  {fusion_info}")
 
     torch.save({
         "encoder_state": enc.state_dict(),
-        "classifier_state": clf.state_dict(),
+        "classifier_state": (clf.state_dict() if clf is not None else None),
         "clf_cfg": clf_cfg.__dict__,
         "val_micro_f1": micro,
         "epoch": cfg.classifier_epochs,
@@ -1750,7 +2044,7 @@ def train_full_model(
             focal_gamma=cfg.focal_gamma,
             use_bce_loss=True,
             path_on_local=False,
-            inbatch_tau=cfg.inbatch_tau,
+            inbatch_tau=cfg.sample_cl_tau,
             weight_cl=1.0,
             use_cl_loss=cfg.use_cl_loss,
             use_path_loss=cfg.use_path_loss,
@@ -1762,6 +2056,7 @@ def train_full_model(
 
     train_tokens = {k: v.to(device) for k, v in train_tokens_full.items()}
     Y_tr = Y_train_full.to(device)
+    label_state = init_label_loss_state(cfg, hd, Y_train_full, label_tokens)
 
     tail_mask_q0_25, tail_mask_q25_50, tail_mask_q50_75, tail_mask_q75_100 = build_tail_level_masks(Y_tr)
     sample_weights = compute_sample_weights(
@@ -1782,19 +2077,23 @@ def train_full_model(
     num_labels = int(sum(hd.level_sizes))
 
 
-    # ---------------- Stage 2: Classifier training ----------------
-    if not cls_on:
-        print("[Full Train] M3 disabled (memory_only): skipping classifier training stage.")
-        return enc, None, clf_cfg
+    # ---------------- Stage 2: Classifier / CL-only training ----------------
+    configure_cl_for_stage2(comb, cfg, classifier_on=cls_on)
 
-    configure_cl_for_stage2(comb, cfg)
-
-    assert clf is not None
-    trainable_params_cls = list(enc.parameters()) + list(clf.parameters())
-    param_groups = [
-        {"params": enc.parameters(), "lr": cfg.contrast_lr},  # encoder finetune lr
-        *build_classifier_param_groups(clf, cfg),
-    ]
+    if cls_on:
+        assert clf is not None
+        trainable_params_cls = list(enc.parameters()) + list(clf.parameters())
+        param_groups = [
+            {"params": enc.parameters(), "lr": cfg.contrast_lr},  # encoder finetune lr
+            *build_classifier_param_groups(clf, cfg),
+        ]
+        train_log_tag = "Cls"
+    else:
+        trainable_params_cls = list(enc.parameters())
+        param_groups = [
+            {"params": enc.parameters(), "lr": cfg.contrast_lr},
+        ]
+        train_log_tag = "MemOnly-CL"
     total_steps_cls = max(1, steps_per_epoch_stage2 * cfg.classifier_epochs)
     warmup_steps_cls = int(cfg.warmup_ratio * total_steps_cls)
     opt = torch.optim.AdamW(param_groups, lr=cfg.classifier_lr)
@@ -1805,9 +2104,11 @@ def train_full_model(
     )
 
     for ep in range(1, cfg.classifier_epochs + 1):
+        maybe_refresh_label_cache(label_state, enc, cfg, device, ep)
         enc.train()
-        clf.train()
-        running = {"bce": 0.0, "cl": 0.0, "path": 0.0, "total": 0.0}
+        if clf is not None:
+            clf.train()
+        running = {"bce": 0.0, "sample_cl_loss": 0.0, "hnm_cl_loss": 0.0, "path": 0.0, "total": 0.0}
 
         base_indices = torch.randperm(Ntr).tolist()
         run_training_indices_common(
@@ -1825,6 +2126,7 @@ def train_full_model(
             opt=opt,
             scheduler=scheduler,
             running=running,
+            label_state=label_state,
         )
 
         if extra_sample_count_stage2 > 0:
@@ -1844,10 +2146,12 @@ def train_full_model(
                 opt=opt,
                 scheduler=scheduler,
                 running=running,
+                label_state=label_state,
             )
 
-        print(f"[Full Train | Cls Ep {ep}] train total={running['total']/Ntr:.4f} | "
-              f"bce={running['bce']/Ntr:.4f} cl={running['cl']/Ntr:.4f} path={running['path']/Ntr:.4f}")
+        print(f"[Full Train | {train_log_tag} Ep {ep}] train total={running['total']/Ntr:.4f} | "
+              f"bce={running['bce']/Ntr:.4f} sample_cl_loss={running['sample_cl_loss']/Ntr:.4f} "
+              f"hnm_cl_loss={running['hnm_cl_loss']/Ntr:.4f} path={running['path']/Ntr:.4f}")
 
     return enc, clf, clf_cfg
 

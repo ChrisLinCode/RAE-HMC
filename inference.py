@@ -159,18 +159,6 @@ class InferenceEngine:
         out = self.predict_batch(s_mem, p_cls, eta=eta, delta=delta, topk=topk, return_intermediate=True)
         return {k: v[0] for k, v in out.items()}
 
-
-# -----------------------------
-# Optional: ef_search control hook for memory (M2)
-# -----------------------------
-def set_memory_ef_search(memory_obj, ef: int) -> None:
-    """
-    Wrapper to adjust ef_search at inference time, if the memory module exposes `set_ef_search`.
-    """
-    if hasattr(memory_obj, "set_ef_search"):
-        memory_obj.set_ef_search(ef)
-
-
 # -----------------------------
 # Minimal smoke test (optional)
 # -----------------------------
