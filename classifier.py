@@ -86,7 +86,6 @@ class ClassifierConfig:
     local_dropout: Optional[float] = None
     # Fusion config (fixed to MLP)
     fusion_hidden_ratio: Optional[float] = None
-    fusion_mode: str = "residual"  # "residual" | "fusion_only"
 
     use_local_branch: Optional[bool] = None  # False -> global-only (flat) head
     use_global_branch: Optional[bool] = None  # False -> local-only head
@@ -104,9 +103,6 @@ class ClassifierConfig:
             raise ValueError("ClassifierConfig.local_head_hidden_ratio must be provided.")
         if self.fusion_hidden_ratio is None:
             raise ValueError("ClassifierConfig.fusion_hidden_ratio must be provided.")
-        self.fusion_mode = str(getattr(self, "fusion_mode", "residual")).lower().strip()
-        if self.fusion_mode not in {"residual", "fusion_only"}:
-            raise ValueError("ClassifierConfig.fusion_mode must be 'residual' or 'fusion_only'.")
         if self.loss is None:
             raise ValueError("ClassifierConfig.loss must be provided (LossConfig).")
         self.loss.validate()
@@ -252,14 +248,11 @@ class DualBranchHierClassifier(nn.Module):
             p_local_concat = None
         p_local = p_local_concat
 
-        # Fusion: choose logits- or prob-space fusion based on cfg
+        # Fusion: fixed residual mode (global + local + fusion residual)
         if self.use_local_branch and self.use_global_branch:
             logits_concat = torch.cat([logits_local_concat, logits_global], dim=-1)  # [B, 2L], logits
             logits_fuse = self.fusion_mlp(logits_concat)
-            if self.cfg.fusion_mode == "fusion_only":
-                logits_sum = logits_fuse
-            else:
-                logits_sum = logits_global + logits_local_concat + logits_fuse
+            logits_sum = logits_global + logits_local_concat + logits_fuse
             p_cls = torch.sigmoid(logits_sum)
         elif self.use_local_branch:
             logits_sum = logits_local_concat

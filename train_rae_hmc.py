@@ -1,11 +1,11 @@
-# train_rae_hmc.py
+﻿# train_rae_hmc.py
 # End-to-end training + validation + test for RAE-HMC
 # Splits train/val/test from a single dataset.csv and prints research metrics to console.
 # Modules required in same folder: build_hierarchy_utils.py, encoder.py, memory.py, classifier.py, inference.py
 
 import os, json, random, math
 from dataclasses import dataclass, field, replace
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Union
 import numpy as np
 import pandas as pd
 import torch
@@ -30,10 +30,11 @@ class TrainConfig:
     text_col: str = "text"
     labels_col: str = "labels"   # labels separated by ';' or ','
     exclude_root_label: bool = True
-    root_label_name: str = "Root"
+    root_label_name: Union[str, List[str]] = field(default_factory=lambda: ["Root", "食材"])
 
     # Split ratio for test set (train:test = 1 - test_ratio : test_ratio)
     test_ratio: float = 0.2
+    seed: int = 42
 
     # Encoder
     model_name: str = "bert-base-chinese"
@@ -41,28 +42,25 @@ class TrainConfig:
     # Label text depth for memory label embeddings:
     # 0=self only, 1=parent>self, 2=grandparent>parent>self, ...
     label_path_depth: int = 1
-    batch_size: int = 16 #HMCN論文配置
+    batch_size: int = 16 
     cache_tokens_on_gpu: bool = True  # cache fold tokens on GPU to reduce CPU->GPU transfer (needs VRAM)
     encoder_pooling: str = "mean"  # "cls" | "mean"
 
     # Training hyperparameters
     classifier_epochs: int = 12
     contrast_lr: float = 5e-5   
-    classifier_lr: float = 3e-3
-    classifier_lr_global: Optional[float] = 1e-2 
-    classifier_lr_local: Optional[float] = 3e-4 
-    classifier_lr_fusion: Optional[float] = 5e-3
+    classifier_lr: float = 7e-3
+    classifier_lr_global: Optional[float] = None 
+    classifier_lr_local: Optional[float] = None 
+    local_lr_scale: float = 0.1 #local 學習率太強會崩掉
+    classifier_lr_fusion: Optional[float] = None
     
-    seed: int = 42
-    warmup_ratio: float = 0.15 #0.15
+    warmup_ratio: float = 0.15 
 
     # contrastive losses (shared master switch)
     use_cl_loss: bool = True
-    sample_cl_tau: float = 0.1
+    cl_tau: float = 0.15
     sample_cl_weight: float = 0.0001
-
-    # label-side HNM contrastive loss
-    hnm_cl_tau: float = 0.1
     hnm_cl_weight: float = 0.01
     hnm_cl_pos_topm: int = 5
     hnm_cl_neg_topk: int = 10
@@ -71,14 +69,9 @@ class TrainConfig:
     # Memory (M2)
     tau_mem: float = 0.07 # memory retrieval temperature
     rho: float = 0.5
-    rho_candidates: List[float] = field(default_factory=lambda: [0.1, 0.3, 0.5, 0.7, 0.9])
     top_b: int = 45
+    rho_candidates: List[float] = field(default_factory=lambda: [0.1, 0.3, 0.5, 0.7, 0.9])
     top_b_candidates: List[int] = field(default_factory=lambda: [15, 30, 45, 60, 75, 90])
-    memory_build_mode: str = "prototype"  # "sample" | "prototype"
-    memory_proto_k: int = 1
-    memory_proto_max_iters: int = 10
-    memory_proto_min_samples: int = 2 #k=1時沒作用
-    memory_proto_restarts: int = 5
 
     # Classifier (M3)
     local_num_heads: int = 2 #多頭注意力頭數
@@ -92,15 +85,13 @@ class TrainConfig:
     global_dropout: Optional[float] = None
     local_dropout: Optional[float] = None    
 
-    fusion_mode: str = "residual"  # "residual" | "fusion_only"
-
     # 預設參數 = HMCN論文配置
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
 
     # path loss
     use_path_loss: bool = True
-    weight_path: float = 1.0 #0.0
+    weight_path: float = 1.0 
 
     # Fusion (M4)
     topk: Optional[int] = 15
@@ -108,7 +99,7 @@ class TrainConfig:
     delta: float = 0.3
     delta_mode: str = "global"  # "global" | "level" (per-level thresholds)    
     eta_candidates: List[float] = field(default_factory=lambda: [0.1, 0.3, 0.5, 0.7, 0.9])
-    delta_candidates: List[float] = field(default_factory=lambda: [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5])
+    delta_candidates: List[float] = field(default_factory=lambda: [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5])
 
     # Sampling (tail-aware / level-aware)
     # Four-bin tail weighting by fixed label frequency quartiles (0-25/25-50/50-75/75-100)
@@ -119,7 +110,7 @@ class TrainConfig:
 
     level_weight_scale: float = 0.05  # per-sample max label depth * scale
 
-    weighted_extra_ratio: float = 1.0
+    weighted_extra_ratio: float = 1.0 #1.0
     val_metric: str = "macro"  # metric for selecting best validation parameters ("micro" or "macro")
     auto_tune_params: bool = True  # If True, tune rho/eta/delta/top_b on validation
 
@@ -147,10 +138,85 @@ def parse_label_cell(cell: str) -> List[str]:
     if "," in s: return [t.strip() for t in s.split(",") if t.strip()]
     return [s.strip()] if s.strip() else []
 
-def strip_root_label(labels: List[str], root_name: str) -> List[str]:
-    if not root_name:
+def parse_root_label_names(root_label_name: Union[str, List[str], Tuple[str, ...], None]) -> List[str]:
+    if root_label_name is None:
+        return []
+
+    names: List[str] = []
+    if isinstance(root_label_name, str):
+        names = [t.strip() for t in root_label_name.replace(";", ",").split(",") if t.strip()]
+    elif isinstance(root_label_name, (list, tuple)):
+        for item in root_label_name:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if not text:
+                continue
+            names.extend([t.strip() for t in text.replace(";", ",").split(",") if t.strip()])
+    else:
+        text = str(root_label_name).strip()
+        if text:
+            names = [text]
+
+    # Deduplicate while preserving order.
+    seen = set()
+    deduped: List[str] = []
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        deduped.append(name)
+    return deduped
+
+def _root_payload_to_dict(payload) -> Dict[str, object]:
+    if isinstance(payload, dict):
+        return dict(payload)
+    promoted: Dict[str, object] = {}
+    if isinstance(payload, list):
+        for elem in payload:
+            if isinstance(elem, dict):
+                for k, v in elem.items():
+                    promoted[k] = v
+            elif isinstance(elem, str):
+                promoted[elem] = None
+    elif isinstance(payload, str):
+        promoted[payload] = None
+    return promoted
+
+def promote_named_roots(hjson: Dict[str, object], root_names: List[str]) -> Dict[str, object]:
+    if not root_names:
+        return hjson
+
+    root_set = set(root_names)
+    current = dict(hjson)
+
+    # Repeatedly peel named roots from current top-level keys:
+    # e.g., Root -> 食材 -> ... with root_names=["Root", "食材"].
+    while any(k in root_set for k in current.keys()):
+        promoted: Dict[str, object] = {}
+        for k, v in current.items():
+            if k in root_set:
+                payload_dict = _root_payload_to_dict(v)
+                for child_k, child_v in payload_dict.items():
+                    if child_k not in promoted:
+                        promoted[child_k] = child_v
+            else:
+                if k not in promoted:
+                    promoted[k] = v
+
+        # Safety guard: avoid infinite loop for pathological self-nested roots.
+        if promoted == current:
+            break
+        current = promoted
+
+    return current
+
+def strip_root_label(labels: List[str], root_names: Union[str, List[str], Tuple[str, ...], None]) -> List[str]:
+    roots = parse_root_label_names(root_names)
+    if not roots:
         return labels
-    return [l for l in labels if l != root_name]
+    root_set = set(roots)
+    return [l for l in labels if l not in root_set]
 
 def build_label_descriptions(hd, path_depth: int) -> List[str]:
     """
@@ -538,7 +604,8 @@ def build_classifier_param_groups(
     cfg: TrainConfig
 ) -> List[Dict[str, object]]:
     lr_global = cfg.classifier_lr_global if cfg.classifier_lr_global is not None else cfg.classifier_lr
-    lr_local = cfg.classifier_lr_local if cfg.classifier_lr_local is not None else cfg.classifier_lr
+    lr_local_default = cfg.classifier_lr * float(getattr(cfg, "local_lr_scale", 0.1))
+    lr_local = cfg.classifier_lr_local if cfg.classifier_lr_local is not None else lr_local_default
     lr_fusion = cfg.classifier_lr_fusion if cfg.classifier_lr_fusion is not None else lr_global
 
     global_params = []
@@ -877,7 +944,7 @@ def init_label_loss_state(
         label_tokens=label_tokens,
         terminal_pos_by_sample=terminal_pos,
         exclude_by_sample=exclude,
-        tau=float(getattr(cfg, "hnm_cl_tau", 0.1)),
+        tau=float(getattr(cfg, "cl_tau", 0.1)),
         topm=int(getattr(cfg, "hnm_cl_pos_topm", 5)),
         topk=int(getattr(cfg, "hnm_cl_neg_topk", 16)),
         weight=weight,
@@ -980,7 +1047,7 @@ def run_training_indices_common(
         running["sample_cl_loss"] += float(losses["loss_cl"]) * bs
         running["path"] += float(losses["loss_path"]) * bs
         running["hnm_cl_loss"] += float(loss_label.detach()) * bs
-        running["total"] += float(loss) * bs
+        running["total"] += float(loss.detach()) * bs
 
 def build_tail_level_masks(
     Y: torch.Tensor,
@@ -1054,66 +1121,14 @@ def compute_sample_weights(
         weights += level_weight_scale * max_levels
     return weights
 
-def get_memory_build_mode(cfg: TrainConfig) -> str:
-    mode = str(getattr(cfg, "memory_build_mode", "sample")).lower().strip()
-    if mode in {"prototype", "proto", "centroid", "kmeans"}:
-        return "prototype"
-    return "sample"
-
-def _kmeans_cosine_centroids(
-    X: torch.Tensor,
-    k: int,
-    max_iters: int,
-    seed: int
-) -> Tuple[torch.Tensor, float]:
-    n = X.size(0)
-    if n == 0:
-        raise ValueError("kmeans requires at least 1 sample.")
-    if k <= 1:
-        centroids = F.normalize(X.mean(dim=0, keepdim=True), p=2, dim=1)
-        sims = (X @ centroids.t()).squeeze(1)
-        sse = torch.sum((1.0 - sims) ** 2).item()
-        return centroids, float(sse)
-    gen = torch.Generator(device=X.device)
-    gen.manual_seed(seed)
-    perm = torch.randperm(n, generator=gen)
-    centroids = X.index_select(0, perm[:k]).clone()
-    prev_assign = None
-    for _ in range(max_iters):
-        sims = X @ centroids.t()
-        assign = sims.argmax(dim=1)
-        if prev_assign is not None and torch.equal(assign, prev_assign):
-            break
-        prev_assign = assign
-        new_centroids = []
-        for j in range(k):
-            mask = assign == j
-            if mask.any():
-                c = X[mask].mean(dim=0)
-            else:
-                idx = int(torch.randint(0, n, (1,), generator=gen))
-                c = X[idx]
-            new_centroids.append(c)
-        centroids = torch.stack(new_centroids, dim=0)
-        centroids = F.normalize(centroids, p=2, dim=1)
-    sims = X @ centroids.t()
-    assign = sims.argmax(dim=1)
-    chosen = sims.gather(1, assign.view(-1, 1)).squeeze(1)
-    sse = torch.sum((1.0 - chosen) ** 2).item()
-    return centroids, float(sse)
-
 def build_memory_prototypes(
     X: torch.Tensor,
     Y: torch.Tensor,
     hd,
-    cfg: TrainConfig
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     X_cpu = X.detach().cpu()
     Y_cpu = Y.detach().cpu()
     L = int(Y_cpu.size(1))
-    k = max(1, int(getattr(cfg, "memory_proto_k", 1)))
-    max_iters = max(1, int(getattr(cfg, "memory_proto_max_iters", 10)))
-    min_samples = max(1, int(getattr(cfg, "memory_proto_min_samples", 2)))
     ancestors = getattr(hd, "ancestors", {})
 
     X_out: List[torch.Tensor] = []
@@ -1124,29 +1139,15 @@ def build_memory_prototypes(
         if idx.numel() == 0:
             continue
         X_label = X_cpu.index_select(0, idx)
-        if k <= 1 or idx.numel() < max(k, min_samples):
-            centroids = F.normalize(X_label.mean(dim=0, keepdim=True), p=2, dim=1)
-            k_eff = 1
-        else:
-            k_eff = min(k, int(idx.numel()))
-            restarts = max(1, int(getattr(cfg, "memory_proto_restarts", 1)))
-            best_sse: Optional[float] = None
-            best_centroids: Optional[torch.Tensor] = None
-            centroids_r: Optional[torch.Tensor] = None
-            for r in range(restarts):
-                seed = int(cfg.seed) + (label + 1) * 1000 + r
-                centroids_r, sse = _kmeans_cosine_centroids(X_label, k_eff, max_iters, seed=seed)
-                if best_sse is None or sse < best_sse:
-                    best_sse = sse
-                    best_centroids = centroids_r
-            centroids = best_centroids if best_centroids is not None else centroids_r
+        # Fixed prototype mode: one centroid per label.
+        centroids = F.normalize(X_label.mean(dim=0, keepdim=True), p=2, dim=1)
 
         target = torch.zeros(L, dtype=torch.float32)
         target[label] = 1.0
         for anc in ancestors.get(label, []):
             target[int(anc)] = 1.0
         X_out.append(centroids)
-        Y_out.append(target.unsqueeze(0).repeat(k_eff, 1))
+        Y_out.append(target.unsqueeze(0))
 
     if not X_out:
         return X_cpu, Y_cpu
@@ -1155,12 +1156,9 @@ def build_memory_prototypes(
 def prepare_memory_inputs(
     X: torch.Tensor,
     Y: torch.Tensor,
-    cfg: TrainConfig,
     hd
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if get_memory_build_mode(cfg) == "prototype":
-        return build_memory_prototypes(X, Y, hd, cfg)
-    return X, Y
+    return build_memory_prototypes(X, Y, hd)
 
 def tune_fusion_parameters(
     enc: SharedEncoder,
@@ -1292,8 +1290,6 @@ def main(cfg: TrainConfig, summary: Optional[List[Dict[str, float]]] = None, sce
                 ("local_only", {"use_memory": False, "use_local_branch": True, "use_global_branch": False}),
                 ("memory_only", {"use_memory": True, "use_local_branch": False, "use_global_branch": False}),
                 ("global_local", {"use_memory": False, "use_local_branch": True, "use_global_branch": True}),
-                ("global+mem", {"use_memory": True, "use_local_branch": False, "use_global_branch": True}),
-                ("local+mem", {"use_memory": True, "use_local_branch": True, "use_global_branch": False}),
                 ("all", {"use_memory": True, "use_local_branch": True, "use_global_branch": True}),
             ])
 
@@ -1347,23 +1343,11 @@ def main(cfg: TrainConfig, summary: Optional[List[Dict[str, float]]] = None, sce
     print(f"Using device: {device}")
 
     # 1) Load hierarchy and dataset
+    root_names = parse_root_label_names(getattr(cfg, "root_label_name", "Root"))
     if bool(getattr(cfg, "exclude_root_label", False)):
         with open(cfg.hierarchy_json, "r", encoding="utf-8") as f:
             hjson = json.load(f)
-        root_name = str(getattr(cfg, "root_label_name", "Root"))
-        if root_name in hjson:
-            payload = hjson[root_name]
-            if isinstance(payload, dict):
-                hjson = payload
-            elif isinstance(payload, list):
-                promoted = {}
-                for elem in payload:
-                    if isinstance(elem, dict):
-                        for k, v in elem.items():
-                            promoted[k] = v
-                    elif isinstance(elem, str):
-                        promoted[elem] = None
-                hjson = promoted if promoted else {}
+        hjson = promote_named_roots(hjson, root_names)
         hd = parse_label_hierarchy(hjson)
     else:
         hd = load_hierarchy_from_file(cfg.hierarchy_json)
@@ -1377,8 +1361,7 @@ def main(cfg: TrainConfig, summary: Optional[List[Dict[str, float]]] = None, sce
     df_all = pd.read_csv(cfg.dataset_csv).reset_index(drop=True)
     all_label_lists = [parse_label_cell(s) for s in df_all[cfg.labels_col].tolist()]
     if bool(getattr(cfg, "exclude_root_label", False)):
-        root_name = str(getattr(cfg, "root_label_name", "Root"))
-        all_label_lists = [strip_root_label(labs, root_name) for labs in all_label_lists]
+        all_label_lists = [strip_root_label(labs, root_names) for labs in all_label_lists]
     Y_all = np.array(build_multi_hot_Y(all_label_lists, hd.label2id, hd.ancestors, add_ancestors=True))
     train_idx_np, test_idx_np = iterative_stratified_split(
         Y_all, cfg.test_ratio, cfg.seed, ensure_test_label_coverage=True
@@ -1539,7 +1522,7 @@ def main(cfg: TrainConfig, summary: Optional[List[Dict[str, float]]] = None, sce
     if cfg.use_memory:
         Z_eval = encode_with_encoder(enc, label_tokens, cfg.batch_size, device)
         X_tr_mem = encode_with_encoder(enc, train_tokens, cfg.batch_size, device)
-        X_mem_base, Y_mem_base = prepare_memory_inputs(X_tr_mem, Y_tr_full, cfg, hd)
+        X_mem_base, Y_mem_base = prepare_memory_inputs(X_tr_mem, Y_tr_full, hd)
         mem = SemanticMemory(mem_cfg_final)
         mem.build(X_mem_base, Z_eval, Y_mem_base)
 
@@ -1673,7 +1656,6 @@ def train_single_fold(
         local_head_hidden_ratio=cfg.local_head_hidden_ratio if cfg.local_head_hidden_ratio is not None else cfg.hidden_ratio,
         local_num_heads=cfg.local_num_heads,
         fusion_hidden_ratio=cfg.fusion_hidden_ratio if cfg.fusion_hidden_ratio is not None else cfg.hidden_ratio,
-        fusion_mode=cfg.fusion_mode,
         global_dropout=cfg.global_dropout,
         local_dropout=cfg.local_dropout,
         use_global_branch=cfg.use_global_branch,
@@ -1684,7 +1666,7 @@ def train_single_fold(
             focal_gamma=cfg.focal_gamma,
             use_bce_loss=True,
             path_on_local=False,
-            inbatch_tau=cfg.sample_cl_tau,
+            inbatch_tau=cfg.cl_tau,
             weight_cl=1.0,
             use_cl_loss=cfg.use_cl_loss,
             use_path_loss=cfg.use_path_loss,
@@ -1868,7 +1850,7 @@ def train_single_fold(
     if cfg.use_memory:
         Z_eval = encode_with_encoder(enc, label_tokens, cfg.batch_size, device)
         X_tr_mem = encode_with_encoder(enc, train_tokens, cfg.batch_size, device)
-        X_mem_base, Y_mem_base = prepare_memory_inputs(X_tr_mem, Y_tr, cfg, hd)
+        X_mem_base, Y_mem_base = prepare_memory_inputs(X_tr_mem, Y_tr, hd)
         if auto_tune_params:
             rho_candidates = getattr(cfg, "rho_candidates", None) or [cfg.rho]
             rho_candidates = list(rho_candidates)
@@ -2033,7 +2015,6 @@ def train_full_model(
         local_head_hidden_ratio=cfg.local_head_hidden_ratio if cfg.local_head_hidden_ratio is not None else cfg.hidden_ratio,
         local_num_heads=cfg.local_num_heads,
         fusion_hidden_ratio=cfg.fusion_hidden_ratio if cfg.fusion_hidden_ratio is not None else cfg.hidden_ratio,
-        fusion_mode=cfg.fusion_mode,
         global_dropout=cfg.global_dropout,
         local_dropout=cfg.local_dropout,
         use_global_branch=cfg.use_global_branch,
@@ -2044,7 +2025,7 @@ def train_full_model(
             focal_gamma=cfg.focal_gamma,
             use_bce_loss=True,
             path_on_local=False,
-            inbatch_tau=cfg.sample_cl_tau,
+            inbatch_tau=cfg.cl_tau,
             weight_cl=1.0,
             use_cl_loss=cfg.use_cl_loss,
             use_path_loss=cfg.use_path_loss,
@@ -2157,3 +2138,4 @@ def train_full_model(
 
 if __name__ == "__main__":
     main(TrainConfig())
+
