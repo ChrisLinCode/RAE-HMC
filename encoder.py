@@ -22,6 +22,8 @@ class EncoderConfig:
     normalize: bool = True
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     fp16: bool = False
+    amp_enabled: bool = False
+    amp_dtype: str = "bf16"
     grad_checkpointing: bool = False
 
 
@@ -74,6 +76,15 @@ class SharedEncoder(nn.Module):
             pooled = _l2_normalize(pooled)
         return pooled
 
+    def _autocast_context(self):
+        device = str(self.cfg.device)
+        amp_enabled = bool(getattr(self.cfg, "amp_enabled", False) or getattr(self.cfg, "fp16", False))
+        if not amp_enabled or not device.startswith("cuda"):
+            return nullcontext()
+        amp_dtype = str(getattr(self.cfg, "amp_dtype", "bf16")).strip().lower()
+        dtype = torch.float16 if amp_dtype in {"fp16", "float16", "half"} else torch.bfloat16
+        return torch.autocast(device_type="cuda", dtype=dtype)
+
     def _encode_batch(
         self,
         texts: List[str],
@@ -97,7 +108,7 @@ class SharedEncoder(nn.Module):
             except Exception:
                 pass
 
-        autocast_ctx = torch.cuda.amp.autocast if (self.cfg.fp16 and device.startswith("cuda")) else nullcontext
+        autocast_ctx = self._autocast_context
         self.eval()
         with torch.no_grad():
             for batch_texts in iterable:
@@ -123,5 +134,7 @@ class SharedEncoder(nn.Module):
         return self._encode_batch(label_descriptions, batch_size=batch_size, progress=progress)
 
     def forward(self, input_ids: Tensor, attention_mask: Tensor, token_type_ids: Optional[Tensor] = None) -> Tensor:
-        out = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
-        return self._pool(out.last_hidden_state, attention_mask)
+        with self._autocast_context():
+            out = self.model(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+            pooled = self._pool(out.last_hidden_state, attention_mask)
+        return pooled

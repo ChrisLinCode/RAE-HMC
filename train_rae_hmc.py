@@ -4,6 +4,7 @@
 # Modules required in same folder: build_hierarchy_utils.py, encoder.py, memory.py, classifier.py, inference.py
 
 import os, json, random, math
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from typing import List, Tuple, Dict, Optional, Union
 import numpy as np
@@ -44,6 +45,7 @@ class TrainConfig:
     label_path_depth: int = 1
     batch_size: int = 16 
     cache_tokens_on_gpu: bool = True  # cache fold tokens on GPU to reduce CPU->GPU transfer (needs VRAM)
+    use_bf16_amp: bool = True
     encoder_pooling: str = "mean"  # "cls" | "mean"
 
     # Training hyperparameters
@@ -331,6 +333,28 @@ def iterative_stratified_split(
 
     train_indices = np.where(available)[0]
     return train_indices.astype(int), np.array(test_indices, dtype=int)
+
+def bf16_amp_enabled(cfg, device: torch.device) -> bool:
+    return bool(getattr(cfg, "use_bf16_amp", False)) and device.type == "cuda"
+
+def bf16_autocast_context(cfg, device: torch.device):
+    if not bf16_amp_enabled(cfg, device):
+        return nullcontext()
+    if not torch.cuda.is_bf16_supported():
+        raise RuntimeError("use_bf16_amp=True but this CUDA device does not support bfloat16 autocast.")
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+def build_encoder_config(cfg: TrainConfig, device_str: str) -> EncoderConfig:
+    return EncoderConfig(
+        model_name=cfg.model_name,
+        max_length=cfg.max_len,
+        pooling=cfg.encoder_pooling,
+        normalize=True,
+        device=device_str,
+        amp_enabled=bool(getattr(cfg, "use_bf16_amp", False)),
+        amp_dtype="bf16",
+        grad_checkpointing=bool(getattr(cfg, "grad_checkpointing", False)),
+    )
 
 def subset_tokens(tokens: Dict[str, torch.Tensor], indices: np.ndarray) -> Dict[str, torch.Tensor]:
     idx_tensor = torch.tensor(indices, dtype=torch.long)
@@ -968,6 +992,7 @@ def maybe_refresh_label_cache(
 
 def run_training_indices_common(
     *,
+    cfg: TrainConfig,
     enc: SharedEncoder,
     clf: Optional[DualBranchHierClassifier],
     comb: JointLossCombiner,
@@ -1000,43 +1025,44 @@ def run_training_indices_common(
         }
         if "token_type_ids" in batch_tokens:
             batch_kwargs["token_type_ids"] = batch_tokens["token_type_ids"]
-        h_x = enc.forward(**batch_kwargs)
+        with bf16_autocast_context(cfg, device):
+            h_x = enc.forward(**batch_kwargs)
 
-        idx_tensor = torch.tensor(batch_idx, dtype=torch.long, device=device)
-        Yb = Y_tr.index_select(0, idx_tensor)
+            idx_tensor = torch.tensor(batch_idx, dtype=torch.long, device=device)
+            Yb = Y_tr.index_select(0, idx_tensor)
 
-        if need_cls:
-            out = clf(h_x)
-            p_cls = out["p_cls"]
-            p_local = out.get("p_local")
-            logits_sum = out.get("logits_sum")
-        else:
-            p_cls = torch.zeros(h_x.size(0), num_labels, device=device)
-            p_local = None
-            logits_sum = torch.zeros_like(p_cls)
+            if need_cls:
+                out = clf(h_x)
+                p_cls = out["p_cls"]
+                p_local = out.get("p_local")
+                logits_sum = out.get("logits_sum")
+            else:
+                p_cls = torch.zeros(h_x.size(0), num_labels, device=device)
+                p_local = None
+                logits_sum = torch.zeros_like(p_cls)
 
-        losses = comb(
-            p_cls=p_cls,
-            logits_cls=logits_sum,
-            p_local=p_local,
-            Y=Yb,
-            mask=None,
-            h_x=h_x,
-            edges_parent_child=edges_pc,
-        )
-        loss_label = h_x.sum() * 0.0
-        if label_state is not None and label_state.enabled:
-            loss_label = compute_label_infonce_loss(
-                enc=enc,
+            losses = comb(
+                p_cls=p_cls,
+                logits_cls=logits_sum,
+                p_local=p_local,
+                Y=Yb,
+                mask=None,
                 h_x=h_x,
-                batch_indices=batch_idx,
-                label_state=label_state,
-                device=device,
+                edges_parent_child=edges_pc,
             )
-        loss = losses["loss_total"] + (
-            float(label_state.weight) * loss_label if (label_state is not None and label_state.enabled) else 0.0
-        )
-        opt.zero_grad()
+            loss_label = h_x.sum() * 0.0
+            if label_state is not None and label_state.enabled:
+                loss_label = compute_label_infonce_loss(
+                    enc=enc,
+                    h_x=h_x,
+                    batch_indices=batch_idx,
+                    label_state=label_state,
+                    device=device,
+                )
+            loss = losses["loss_total"] + (
+                float(label_state.weight) * loss_label if (label_state is not None and label_state.enabled) else 0.0
+            )
+        opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
         opt.step()
@@ -1379,7 +1405,7 @@ def main(cfg: TrainConfig, summary: Optional[List[Dict[str, float]]] = None, sce
 
     # 3) M1: Shared encoder (jointly trained)
     print("[Stage] Initializing shared encoder...")
-    enc = SharedEncoder(EncoderConfig(model_name=cfg.model_name, max_length=cfg.max_len, pooling=cfg.encoder_pooling, normalize=True, device=device_str))
+    enc = SharedEncoder(build_encoder_config(cfg, device_str))
     print("[Stage] Tokenizing train/test/label texts...")
     label_descs = build_label_descriptions(hd, getattr(cfg, "label_path_depth", 1))
     train_tokens = tokenize_texts(enc.tokenizer, tr_texts, cfg.max_len)
@@ -1646,7 +1672,7 @@ def train_single_fold(
 ) -> Dict[str, object]:
     print(f"\n[Fold {fold_name}] Training on {len(train_indices)} samples, validating on {len(val_indices)} samples")
     cls_on = classifier_enabled(cfg)
-    enc = SharedEncoder(EncoderConfig(model_name=cfg.model_name, max_length=cfg.max_len, pooling=cfg.encoder_pooling, normalize=True, device=device_str))
+    enc = SharedEncoder(build_encoder_config(cfg, device_str))
     clf_cfg = ClassifierConfig(
         hidden_size=enc.hidden_size,
         level_sizes=hd.level_sizes,
@@ -1778,6 +1804,7 @@ def train_single_fold(
 
         base_indices = torch.randperm(Ntr).tolist()
         run_training_indices_common(
+            cfg=cfg,
             enc=enc,
             clf=clf,
             comb=comb,
@@ -1798,6 +1825,7 @@ def train_single_fold(
         if extra_sample_count_stage2 > 0:
             extra_indices = torch.multinomial(weight_tensor, num_samples=extra_sample_count_stage2, replacement=True).tolist()
             run_training_indices_common(
+                cfg=cfg,
                 enc=enc,
                 clf=clf,
                 comb=comb,
@@ -2005,7 +2033,7 @@ def train_full_model(
 ) -> Tuple[SharedEncoder, Optional[DualBranchHierClassifier], ClassifierConfig]:
     print("\n[Full Train] Training on all stratified training samples...")
     cls_on = classifier_enabled(cfg)
-    enc = SharedEncoder(EncoderConfig(model_name=cfg.model_name, max_length=cfg.max_len, pooling=cfg.encoder_pooling, normalize=True, device=device_str))
+    enc = SharedEncoder(build_encoder_config(cfg, device_str))
     clf_cfg = ClassifierConfig(
         hidden_size=enc.hidden_size,
         level_sizes=hd.level_sizes,
@@ -2093,6 +2121,7 @@ def train_full_model(
 
         base_indices = torch.randperm(Ntr).tolist()
         run_training_indices_common(
+            cfg=cfg,
             enc=enc,
             clf=clf,
             comb=comb,
@@ -2113,6 +2142,7 @@ def train_full_model(
         if extra_sample_count_stage2 > 0:
             extra_indices = torch.multinomial(weight_tensor, num_samples=extra_sample_count_stage2, replacement=True).tolist()
             run_training_indices_common(
+                cfg=cfg,
                 enc=enc,
                 clf=clf,
                 comb=comb,

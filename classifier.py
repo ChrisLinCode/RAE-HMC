@@ -235,8 +235,10 @@ class DualBranchHierClassifier(nn.Module):
             p_local_list = [torch.sigmoid(lg) for lg in logits_local_list]
 
             if self.level_slices is not None:
-                logits_local_concat = torch.zeros(h.size(0), self.L, device=h.device)
-                p_local_concat = torch.zeros(h.size(0), self.L, device=h.device)
+                logits_dtype = logits_local_list[0].dtype if logits_local_list else h.dtype
+                p_local_dtype = p_local_list[0].dtype if p_local_list else h.dtype
+                logits_local_concat = torch.zeros(h.size(0), self.L, device=h.device, dtype=logits_dtype)
+                p_local_concat = torch.zeros(h.size(0), self.L, device=h.device, dtype=p_local_dtype)
                 for l_logits, p_lvl, idx in zip(logits_local_list, p_local_list, self.level_slices):
                     logits_local_concat.index_copy_(1, idx.to(h.device), l_logits)
                     p_local_concat.index_copy_(1, idx.to(h.device), p_lvl)
