@@ -1,0 +1,8 @@
+torch
+transformers
+torch-geometric
+torch-scatter
+torch-sparse
+pandas
+scikit-learn
+tqdm

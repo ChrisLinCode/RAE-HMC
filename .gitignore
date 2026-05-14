@@ -1,0 +1,52 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local environments and secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+ENV/
+
+# Editor and OS local files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+.codex
+
+# Project-generated experiment outputs
+outputs/
+
+# Logs and temporary files
+*.log
+*.tmp
+tmp/
+temp/
+
+# Model checkpoints and generated tensor artifacts
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Baseline-generated artifacts
+baselines/BERT-FT/checkpoints/
+baselines/HILL/ckpt/
+baselines/HILL/outputs/
+baselines/HGCLR/checkpoints/
+baselines/HGCLR/outputs/
