@@ -1,0 +1,13 @@
+checkpoints/
+.idea/
+outputs/
+
+__pycache__/
+*.py[cod]
+
+# Generated RAE-HMC/HPT datasets and Hugging Face prompt caches.
+data/__pycache__/
+data/hptdepth_*/
+data/raehmc_food*/
+data/*/prompt/
+models/__pycache__/
