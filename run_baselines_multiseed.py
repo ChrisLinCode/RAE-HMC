@@ -14,6 +14,7 @@ RAEHMC_RESULT_PREFIX = "BASELINE_RESULT_JSON="
 REMOVED_COLUMNS = {"raehmc_no_cl_micro", "raehmc_no_cl_macro"}
 BERT_FT_RESULT_PREFIX = "BERT_FT_RESULT_JSON="
 HGCLR_METRIC_RE = re.compile(r"macro\s+([0-9]*\.?[0-9]+)\s+micro\s+([0-9]*\.?[0-9]+)")
+HPT_METRIC_RE = re.compile(r"macro\s+([0-9]*\.?[0-9]+)\s+micro\s+([0-9]*\.?[0-9]+)")
 HILL_METRIC_RE = re.compile(r"micro-f1:\s*([0-9]*\.?[0-9]+)\s+macro-f1:\s*([0-9]*\.?[0-9]+)", re.MULTILINE)
 
 RAEHMC_INLINE = r"""
@@ -58,7 +59,7 @@ def default_env_python(env_name: str) -> str:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run multi-seed baseline evaluations for BERT-FT, RAE-HMC, HGCLR, and HILL, then save a CSV for paired tests."
+        description="Run multi-seed baseline evaluations for BERT-FT, RAE-HMC, HGCLR, HILL, and HPT, then save a CSV for paired tests."
     )
     parser.add_argument("--run-bert-ft", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -69,6 +70,7 @@ def parse_args():
     )
     parser.add_argument("--run-hgclr", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--run-hill", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--run-hpt", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--seeds", nargs="+", type=int, default=None, help="Explicit seed list. Overrides seed-start/end.")
     parser.add_argument("--seed-start", type=int, default=41)
@@ -123,6 +125,14 @@ def parse_args():
     parser.add_argument("--hill-eval-checkpoint", default="macro", choices=["macro", "micro"])
     parser.add_argument("--hill-epochs", type=int, default=None)
     parser.add_argument("--hill-early-stop", type=int, default=None)
+
+    parser.add_argument("--hpt-python", default=default_env_python("hpt-gpu"))
+    parser.add_argument("--hpt-batch", type=int, default=2)
+    parser.add_argument("--hpt-lr", type=float, default=3e-5)
+    parser.add_argument("--hpt-early-stop", type=int, default=6)
+    parser.add_argument("--hpt-max-token", type=int, default=512)
+    parser.add_argument("--hpt-eval-checkpoint", default="_macro", choices=["_macro", "_micro"])
+    parser.add_argument("--hpt-epochs", type=int, default=None)
 
     parser.add_argument(
         "--output-csv",
@@ -237,6 +247,14 @@ def parse_hgclr_metrics(output: str) -> dict[str, float]:
     matches = HGCLR_METRIC_RE.findall(output)
     if not matches:
         raise ValueError("Could not parse HGCLR metrics from output.")
+    macro, micro = matches[-1]
+    return {"micro": float(micro), "macro": float(macro)}
+
+
+def parse_hpt_metrics(output: str) -> dict[str, float]:
+    matches = HPT_METRIC_RE.findall(output)
+    if not matches:
+        raise ValueError("Could not parse HPT metrics from output.")
     macro, micro = matches[-1]
     return {"micro": float(micro), "macro": float(macro)}
 
@@ -492,9 +510,79 @@ def run_hill(seed: int, args, repo_root: Path) -> dict[str, float]:
             shutil.rmtree(checkpoint_dir, ignore_errors=True)
 
 
+def run_hpt(seed: int, args, repo_root: Path) -> dict[str, float]:
+    hpt_root = repo_root / "baselines" / "HPT"
+    dataset_name = f"{args.temp_prefix}_{args.dataset_base}_s{seed}"
+    run_name = f"{args.temp_prefix}_s{seed}"
+    full_run_name = f"{dataset_name}-{run_name}"
+    dataset_dir = hpt_root / "data" / dataset_name
+    checkpoint_dir = hpt_root / "checkpoints" / full_run_name
+
+    if dataset_dir.exists():
+        shutil.rmtree(dataset_dir, ignore_errors=True)
+    if checkpoint_dir.exists():
+        shutil.rmtree(checkpoint_dir, ignore_errors=True)
+
+    prepare_cmd = [
+        args.hpt_python,
+        "data/prepare_raehmc.py",
+        "--seed",
+        str(seed),
+        "--output-dir",
+        str(dataset_dir),
+    ]
+    train_cmd = [
+        args.hpt_python,
+        "train.py",
+        "--data",
+        dataset_name,
+        "--name",
+        run_name,
+        "--arch",
+        args.plm,
+        "--seed",
+        str(seed),
+        "--device",
+        args.device,
+        "--batch",
+        str(args.hpt_batch),
+        "--lr",
+        str(args.hpt_lr),
+        "--early-stop",
+        str(args.hpt_early_stop),
+        "--max-token",
+        str(args.hpt_max_token),
+    ]
+    if args.hpt_epochs is not None:
+        train_cmd.extend(["--epochs", str(args.hpt_epochs)])
+
+    test_cmd = [
+        args.hpt_python,
+        "test.py",
+        "--name",
+        full_run_name,
+        "--extra",
+        args.hpt_eval_checkpoint,
+        "--device",
+        args.device,
+        "--batch",
+        str(args.hpt_batch),
+    ]
+
+    try:
+        run_command(prepare_cmd, hpt_root)
+        run_command(train_cmd, hpt_root)
+        output = run_command(test_cmd, hpt_root)
+        return parse_hpt_metrics(output)
+    finally:
+        if args.cleanup:
+            shutil.rmtree(dataset_dir, ignore_errors=True)
+            shutil.rmtree(checkpoint_dir, ignore_errors=True)
+
+
 def summarize(csv_path: Path, rows: list[dict], fieldnames: list[str]):
     print(f"\nSaved paired-test CSV: {csv_path}")
-    for model_name in ("bert_ft", "raehmc", "hgclr", "hill"):
+    for model_name in ("bert_ft", "raehmc", "hgclr", "hill", "hpt"):
         micro_key = f"{model_name}_micro"
         macro_key = f"{model_name}_macro"
         if micro_key not in fieldnames:
@@ -530,12 +618,14 @@ def requested_model_columns(args) -> list[str]:
         columns.extend(["hgclr_micro", "hgclr_macro"])
     if args.run_hill:
         columns.extend(["hill_micro", "hill_macro"])
+    if args.run_hpt:
+        columns.extend(["hpt_micro", "hpt_macro"])
     return columns
 
 
 def main():
     args = parse_args()
-    if not any((args.run_bert_ft, args.run_raehmc, args.run_hgclr, args.run_hill)):
+    if not any((args.run_bert_ft, args.run_raehmc, args.run_hgclr, args.run_hill, args.run_hpt)):
         raise ValueError("At least one model must be enabled.")
 
     repo_root = Path(__file__).resolve().parent
@@ -549,22 +639,30 @@ def main():
         ensure_python_exists(args.hgclr_python, "HGCLR")
     if args.run_hill:
         ensure_python_exists(args.hill_python, "HILL")
+    if args.run_hpt:
+        ensure_python_exists(args.hpt_python, "HPT")
 
     if args.output_csv is None:
         output_csv = repo_root / "outputs" / "baselines_multiseed" / "baselines_multiseed.csv"
     else:
         output_csv = (repo_root / args.output_csv).resolve() if not Path(args.output_csv).is_absolute() else Path(args.output_csv)
 
-    fieldnames = ["seed"] + requested_model_columns(args)
+    requested_columns = requested_model_columns(args)
+    fieldnames = ["seed"] + requested_columns
     existing_fieldnames: list[str] = []
     existing_rows: dict[int, dict[str, str]] = {}
     if args.append_existing:
         existing_fieldnames, existing_rows = load_existing_csv(output_csv)
         if existing_rows:
             print(f"Loaded existing CSV: {output_csv} ({len(existing_rows)} rows)")
-        for name in existing_fieldnames:
-            if name not in fieldnames:
-                fieldnames.append(name)
+        if existing_fieldnames:
+            fieldnames = ["seed"]
+            for name in existing_fieldnames:
+                if name != "seed" and name not in fieldnames:
+                    fieldnames.append(name)
+            for name in requested_columns:
+                if name not in fieldnames:
+                    fieldnames.append(name)
         for name in fieldnames:
             for row in existing_rows.values():
                 row.setdefault(name, "")
@@ -636,6 +734,22 @@ def main():
                 metrics = run_hill(seed, args, repo_root)
                 row["hill_micro"] = f"{metrics['micro']:.4f}"
                 row["hill_macro"] = f"{metrics['macro']:.4f}"
+                print(
+                    f"    done: micro={metrics['micro']:.4f}, macro={metrics['macro']:.4f}",
+                    flush=True,
+                )
+
+        if args.run_hpt:
+            if should_skip(row, "hpt", args.overwrite_existing):
+                print("  - skipping HPT (already in CSV)", flush=True)
+            else:
+                if has_metrics(row, "hpt"):
+                    print("  - re-running HPT (overwriting CSV)", flush=True)
+                else:
+                    print("  - running HPT", flush=True)
+                metrics = run_hpt(seed, args, repo_root)
+                row["hpt_micro"] = f"{metrics['micro']:.4f}"
+                row["hpt_macro"] = f"{metrics['macro']:.4f}"
                 print(
                     f"    done: micro={metrics['micro']:.4f}, macro={metrics['macro']:.4f}",
                     flush=True,

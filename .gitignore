@@ -50,3 +50,5 @@ baselines/HILL/ckpt/
 baselines/HILL/outputs/
 baselines/HGCLR/checkpoints/
 baselines/HGCLR/outputs/
+baselines/HPT/checkpoints/
+baselines/HPT/data/*raehmc_food*/

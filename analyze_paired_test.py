@@ -14,6 +14,7 @@ FRIENDLY_MODEL_NAMES = {
     "bert_ft": "BERT-FT",
     "hgclr": "HGCLR",
     "hill": "HILL",
+    "hpt": "HPT",
     "global_only": "HMCN-Global only",
     "local_only": "HMCN-Local only",
     "memory_only": "Retrieval only",
