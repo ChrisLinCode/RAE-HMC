@@ -84,31 +84,40 @@ python createDataset.py --hier label_hierarchy.json --ann ann.csv --out dataset.
 
 ## Environment
 
-There is no pinned top-level environment file yet. The core RAE-HMC pipeline
-uses the following main packages:
-
-- Python 3.10 or newer
-- PyTorch
-- transformers
-- numpy
-- pandas
-- tqdm
-- faiss-cpu or faiss-gpu
-
-Optional analysis and plotting scripts may also require:
-
-- scipy
-- matplotlib
-- seaborn
-
-Example setup:
+The recommended setup is to create a fresh Python environment and install the
+top-level requirements:
 
 ```bash
-pip install torch transformers numpy pandas tqdm faiss-cpu
-pip install scipy matplotlib seaborn
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-Install the PyTorch build that matches your CUDA version if training on GPU.
+Use Python 3.10 or newer. Install the PyTorch build that matches your CUDA
+version if training on GPU. The `requirements.txt` file uses the generic
+`torch` package name; for CUDA-specific installs, install the matching PyTorch
+wheel first and then run:
+
+```bash
+pip install -r requirements.txt
+```
+
+The core RAE-HMC pipeline mainly depends on PyTorch, Transformers, NumPy,
+Pandas, tqdm, and FAISS. Analysis scripts additionally use SciPy, Matplotlib,
+Seaborn, and OpenPyXL. The adapted HGCLR/HILL/HPT baselines use extra packages
+such as scikit-learn, Hugging Face datasets, numba, torch-geometric,
+torch-sparse, and optionally wandb.
+
+If `torch-geometric` or `torch-sparse` installation fails, install PyTorch
+Geometric packages that match your local PyTorch and CUDA versions, then rerun:
+
+```bash
+pip install -r requirements.txt
+```
+
+For CPU-only execution, `faiss-cpu` is sufficient. GPU FAISS users can replace
+it with the FAISS package appropriate for their environment.
 
 ## Usage
 

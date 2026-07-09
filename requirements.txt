@@ -1,0 +1,21 @@
+# Core RAE-HMC pipeline
+torch
+transformers
+numpy
+pandas
+tqdm
+faiss-cpu
+
+# Analysis, statistics, and plotting
+scipy
+matplotlib
+seaborn
+openpyxl
+
+# Baseline runners and adapted baseline implementations
+scikit-learn
+datasets
+numba
+torch-geometric
+torch-sparse
+wandb
