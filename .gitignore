@@ -31,6 +31,7 @@ ENV/
 
 # Project-generated experiment outputs
 outputs/
+dataset/dataset_excel.csv
 
 # Logs and temporary files
 *.log
@@ -50,5 +51,6 @@ baselines/HILL/ckpt/
 baselines/HILL/outputs/
 baselines/HGCLR/checkpoints/
 baselines/HGCLR/outputs/
+baselines/HGCLR/data/tmp*/
 baselines/HPT/checkpoints/
 baselines/HPT/data/*raehmc_food*/
